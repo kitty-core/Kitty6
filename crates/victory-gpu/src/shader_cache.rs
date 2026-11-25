@@ -144,6 +144,11 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
         }
+        // Whether the ray-tracing node test always misses (`VICTORY_RT_MISS=1`).
+        // Only when on, so the translations cached without it keep their key.
+        if victory_shader::emit::rt_miss() {
+            bytes.extend_from_slice(b"VICTORY_RT_MISS=1");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();
