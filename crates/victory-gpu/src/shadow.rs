@@ -5569,12 +5569,73 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     Some(shadow)
 }
 
+/// The most an ask without a length (a root view) is given past its 4 MiB
+/// cell, in bytes: `VICTORY_ROOT_WINDOW_MB` (32; 4 = the cell alone, as
+/// before), in whole cells.
+fn root_window_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let mb = std::env::var("VICTORY_ROOT_WINDOW_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        (mb.unwrap_or(32).clamp(4, 256) << 20) / WINDOW * WINDOW
+    })
+}
+
+/// The window of an ask without a length at `[address, end)`: its 4 MiB
+/// cell, and on past it while the title's memory stays committed, up to
+/// [`root_window_most`].
+///
+/// A root view has no size, and the shader reads on from its address
+/// through the copy it was given. Held to its cell, a view into a big
+/// allocation outside any buffer object (a 12 MB vertex pool, say) read
+/// past the end of its 4 MiB window into whatever the host had placed
+/// after it: in the intro (DRED, RX 7900 XT) the card faulted 0xbfd000
+/// bytes into the window of title 0xcae400000, at memory freed texture
+/// staging had held, and the device was removed. The memory the title
+/// committed around the view is what it can be reading.
+fn root_window(address: u64, end: u64) -> (u64, u64) {
+    let (cell, len) = window_of(address, end, WINDOW);
+    let most = root_window_most();
+    if most <= len {
+        return (cell, len);
+    }
+    root_extent(cell, len, committed_reach(cell + len, cell + most), most)
+}
+
+/// The window from `cell` of at least `len` bytes that reaches `reach`,
+/// rounded up to whole cells and held to `most` bytes.
+fn root_extent(cell: u64, len: u64, reach: u64, most: u64) -> (u64, u64) {
+    let end = reach.next_multiple_of(WINDOW).min(cell + most).max(cell + len);
+    (cell, end - cell)
+}
+
+/// Where the title's committed memory that runs on from `from` ends, looked
+/// at no further than `limit` (`from` itself if `from` is not committed).
+fn committed_reach(from: u64, limit: u64) -> u64 {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut at = from;
+    while at < limit {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a query of our own address space into `info`.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 || info.State != MEM_COMMIT || info.RegionSize == 0 {
+            break;
+        }
+        at = info.BaseAddress as u64 + info.RegionSize as u64;
+    }
+    at.min(limit)
+}
+
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(address, end, WINDOW);
-    let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
+    let named = if unsized_ask && !tails() {
+        root_window(address, end)
+    } else {
+        window_of(address, end, if unsized_ask { WINDOW } else { window() })
+    };
     // Under the lock, with the handing out: see `let_go_idle`.
     let note = |shadow: &Shadow| {
         // (Read first: the lines are shared by all recording threads.)
@@ -5977,6 +6038,40 @@ mod window_tests {
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
         }
+    }
+
+    /// A root view's window reaches as far as the memory around it, in
+    /// whole cells, never less than its cell and never past the most.
+    #[test]
+    fn root_windows_reach_the_committed_memory() {
+        use super::root_extent;
+        let cell = 0xcae4_00000u64;
+        let most = 32 << 20;
+        assert_eq!(root_extent(cell, WINDOW, cell + WINDOW, most), (cell, WINDOW));
+        assert_eq!(root_extent(cell, WINDOW, cell + 0xbfd000 + 1, most), (cell, 12 << 20));
+        assert_eq!(root_extent(cell, WINDOW, cell + (12 << 20) + 1, most), (cell, 16 << 20));
+        assert_eq!(root_extent(cell, WINDOW, cell + (1 << 30), most), (cell, most));
+        assert_eq!(root_extent(cell, 2 * WINDOW, cell + WINDOW, most), (cell, 2 * WINDOW));
+    }
+
+    /// The reach of committed memory stops where the commitment does.
+    #[test]
+    fn committed_reach_stops_at_the_end_of_committed_memory() {
+        use super::committed_reach;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // SAFETY: a fresh reservation of our own, freed below.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 16 << 20, MEM_RESERVE, PAGE_READWRITE) } as u64;
+        assert_ne!(base, 0);
+        // SAFETY: inside the reservation just made.
+        let done = unsafe { VirtualAlloc(base as *const _, 12 << 20, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!done.is_null());
+        assert_eq!(committed_reach(base, base + (16 << 20)), base + (12 << 20));
+        assert_eq!(committed_reach(base, base + (8 << 20)), base + (8 << 20));
+        assert_eq!(committed_reach(base + (12 << 20), base + (16 << 20)), base + (12 << 20));
+        // SAFETY: our own reservation, nothing else uses it.
+        assert_ne!(unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) }, 0);
     }
 }
 
