@@ -2128,7 +2128,16 @@ pub(crate) fn let_go_idle() {
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
+    // The card's room says nothing of the PC's: what the card spills to
+    // system memory is commit too. Short of it ([`crate::residency::pressured`]),
+    // idle copies go after seconds, not the minutes room on the card keeps them
+    // (Fayberr/Victory-United 00a21ef4; `VICTORY_TEXTURE_PRESSURE_IDLE=0`: as
+    // before). Here the pressure signal is only on with `VICTORY_RESIDENCY=1`.
+    static PRESSURE_IDLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let pressure_idle =
+        *PRESSURE_IDLE.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_PRESSURE_IDLE").is_none_or(|v| v != "0"));
     let (idle_ms, most) = match memory {
+        _ if pressure_idle && crate::residency::pressured() => (5_000, u64::MAX),
         Some([budget, used, ..]) if keep => {
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()

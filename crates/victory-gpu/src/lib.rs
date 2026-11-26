@@ -116,6 +116,8 @@ mod upload;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]
+mod windowskip;
+#[cfg(windows)]
 mod texback;
 
 #[cfg(windows)]

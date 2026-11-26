@@ -96,6 +96,16 @@ pub(crate) struct Shadow {
     changes_only: std::sync::atomic::AtomicBool,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
+    /// A window with no card side: per 4 KiB page of title memory from the
+    /// window's first on, a print of the bytes last copied into its buffer
+    /// (0: none, or only a part of the page) (`crate::windowskip`); empty
+    /// until the window first takes title memory with the switch set.
+    /// Locked around the copy.
+    prints: Mutex<Vec<u64>>,
+    /// Whether shaders were ever said to write the copy
+    /// ([`Shadow::writing`]): a window with no card side then compares
+    /// nothing with what it last copied (its buffer may hold their bytes).
+    written_said: std::sync::atomic::AtomicBool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -1304,11 +1314,16 @@ mod relay_tests {
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
+/// When a snapshot buffer was last taken from or given back to [`POOL`]
+/// ([`crate::host::moment`]), for [`let_go_idle_snapshots`].
+static POOL_USED: AtomicU64 = AtomicU64::new(0);
+
 /// An empty buffer with room for `n` bytes, from the pool if it has one
 /// of about that size: a small copy's snapshot took the 174 MB buffer kept
 /// for the big heap's, which then got another, until eight of them were
 /// reserved (1.4 GB in run 24).
 fn pooled(n: usize) -> Vec<u8> {
+    POOL_USED.store(crate::host::moment(), Ordering::Relaxed);
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let most = n.saturating_mul(4).max(1 << 20);
     let fit = pool
@@ -1344,6 +1359,7 @@ fn snapshots_kept() -> usize {
 /// bytes in all.
 fn give_back(v: Vec<u8>) {
     const KEPT: usize = 512 << 20;
+    POOL_USED.store(crate::host::moment(), Ordering::Relaxed);
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
@@ -1359,6 +1375,161 @@ fn give_back(v: Vec<u8>) {
     let gone = pool.split_off(kept);
     drop(pool);
     drop(gone);
+}
+
+/// What [`POOL`] keeps while the host is short of memory
+/// ([`crate::residency::pressured`]): the smallest buffers, up to this many
+/// bytes in all. They are the ones asked for most (most of a frame's 330
+/// ranges are small), and the large ones are what fills the 512 MiB.
+const POOL_PRESSURED_KEPT: usize = 32 << 20;
+
+/// Lets go of the snapshot buffers [`POOL`] keeps when nobody wants them.
+/// Only [`give_back`] ever trimmed the pool, and only when another buffer
+/// came back, so once snapshots stopped the last 512 MiB stayed for the
+/// rest of the run, low memory or not (a load test: 524,123 KiB kept after
+/// five idle seconds; 13 MiB private once emptied by hand). Now
+/// - idle for the time the other host caches wait ([`crate::host::ram_idle_ms`])
+///   and four frames, all of it goes;
+/// - while the host is short of memory, all but [`POOL_PRESSURED_KEPT`]
+///   goes, the largest first, whatever the size of the largest.
+///
+/// The next snapshot is then memory fresh from the kernel, as it was for
+/// every snapshot past the pool before. Called by the once-a-second sweep.
+///
+/// `VICTORY_SNAPSHOT_POOL_IDLE=0`: the pool is kept as before (only
+/// [`give_back`] trims it).
+fn let_go_idle_snapshots() {
+    const IDLE_FRAMES: u64 = 4;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_SNAPSHOT_POOL_IDLE").is_none_or(|v| v != "0")) {
+        return;
+    }
+    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let idle = crate::host::long_ago(POOL_USED.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES);
+    let Some(most) = snapshots_to_keep(idle, crate::residency::pressured()) else {
+        return;
+    };
+    let gone = {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        trim_pool(&mut pool, most)
+    };
+    // (Given back to the kernel without the lock.)
+    drop(gone);
+}
+
+/// How many bytes of snapshot buffers [`POOL`] may keep: none once idle,
+/// [`POOL_PRESSURED_KEPT`] while the host is short of memory, otherwise
+/// what [`give_back`] keeps (`None`: nothing to do).
+fn snapshots_to_keep(idle: bool, pressured: bool) -> Option<usize> {
+    if idle {
+        Some(0)
+    } else if pressured {
+        Some(POOL_PRESSURED_KEPT)
+    } else {
+        None
+    }
+}
+
+/// Keeps the smallest buffers of `pool`, up to `most` bytes of capacity in
+/// all, and returns the others (largest first) for the caller to free.
+fn trim_pool(pool: &mut Vec<Vec<u8>>, most: usize) -> Vec<Vec<u8>> {
+    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+    let mut total = 0usize;
+    let mut keep = 0;
+    for v in pool.iter().rev() {
+        total = total.saturating_add(v.capacity());
+        if total > most {
+            break;
+        }
+        keep += 1;
+    }
+    let first_kept = pool.len() - keep;
+    let kept = pool.split_off(first_kept);
+    std::mem::replace(pool, kept)
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    fn sizes(pool: &[Vec<u8>]) -> Vec<usize> {
+        pool.iter().map(Vec::capacity).collect()
+    }
+
+    #[test]
+    fn trimming_keeps_the_smallest_up_to_the_limit() {
+        let mut pool: Vec<Vec<u8>> = [8usize, 1, 4, 2].iter().map(|&n| Vec::with_capacity(n << 20)).collect();
+        let gone = trim_pool(&mut pool, 7 << 20);
+        assert_eq!(sizes(&pool), [4 << 20, 2 << 20, 1 << 20]);
+        assert_eq!(sizes(&gone), [8 << 20]);
+    }
+
+    #[test]
+    fn trimming_to_nothing_empties_the_pool() {
+        let mut pool: Vec<Vec<u8>> = [3usize, 1].iter().map(|&n| Vec::with_capacity(n << 20)).collect();
+        let gone = trim_pool(&mut pool, 0);
+        assert!(pool.is_empty());
+        assert_eq!(sizes(&gone), [3 << 20, 1 << 20]);
+    }
+
+    #[test]
+    fn a_buffer_past_the_limit_goes_even_alone() {
+        // `give_back` always keeps its largest buffer; under pressure that
+        // one goes too.
+        let mut pool = vec![Vec::<u8>::with_capacity(600 << 20)];
+        let gone = trim_pool(&mut pool, POOL_PRESSURED_KEPT);
+        assert!(pool.is_empty());
+        assert_eq!(gone.len(), 1);
+    }
+
+    #[test]
+    fn an_idle_pool_goes_and_a_pressed_one_shrinks() {
+        assert_eq!(snapshots_to_keep(true, false), Some(0));
+        assert_eq!(snapshots_to_keep(true, true), Some(0));
+        assert_eq!(snapshots_to_keep(false, true), Some(POOL_PRESSURED_KEPT));
+        assert_eq!(snapshots_to_keep(false, false), None);
+    }
+
+    /// The pool after snapshots stop, in a process's private bytes: before,
+    /// 512 MiB stayed however long nothing asked. Run alone (the pool is
+    /// global): `cargo test -p victory-gpu --lib
+    /// shadow::pool_tests::pool_memory_load -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore]
+    fn pool_memory_load() {
+        fn private_kib() -> usize {
+            use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            // SAFETY: plain data the call fills in, for this process.
+            let mut c: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+            c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+            unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut c).cast(), c.cb) };
+            c.PrivateUsage >> 10
+        }
+        let start = private_kib();
+        for i in 0..256usize {
+            let mut v = pooled((1 + i % 32) << 20);
+            v.resize(v.capacity(), 1);
+            give_back(v);
+        }
+        let kept: usize = POOL.lock().unwrap().iter().map(Vec::capacity).sum();
+        let full = private_kib();
+        let gone = trim_pool(&mut POOL.lock().unwrap(), POOL_PRESSURED_KEPT);
+        drop(gone);
+        let pressed = private_kib();
+        let gone = trim_pool(&mut POOL.lock().unwrap(), 0);
+        drop(gone);
+        let idle = private_kib();
+        eprintln!(
+            "pool kept {} KiB; private KiB over the start: full {}, pressed {}, idle {}",
+            kept >> 10,
+            full.saturating_sub(start),
+            pressed.saturating_sub(start),
+            idle.saturating_sub(start)
+        );
+        assert!(pressed.saturating_sub(start) <= (POOL_PRESSURED_KEPT >> 10) + 8 * 1024);
+        assert!(POOL.lock().unwrap().is_empty());
+    }
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -2682,6 +2853,10 @@ impl Drop for Shadow {
         if self.mapped {
             WINDOW_MAPPED_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
+        let prints = self.prints.get_mut().unwrap_or_else(|e| e.into_inner()).len();
+        if prints != 0 {
+            crate::windowskip::prints_gone(prints);
+        }
         if let Some(card) = &mut self.card {
             if window {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
@@ -3040,6 +3215,8 @@ static WINDOW_BAND: std::sync::Mutex<crate::host::RamBand> =
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
+    // Before the windows: their table may be empty while the pool is not.
+    let_go_idle_snapshots();
     let budget = window_budget();
     let mut idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
     let mut keep = u64::MAX;
@@ -3254,6 +3431,8 @@ impl Shadow {
             window: false,
             changes_only: Default::default(),
             mapped: false,
+            prints: Mutex::default(),
+            written_said: std::sync::atomic::AtomicBool::new(false),
             place: None,
         }
     }
@@ -3299,6 +3478,11 @@ impl Shadow {
     pub(crate) fn writing(&self, address: usize, len: usize) {
         if self.place.is_some() {
             return;
+        }
+        // A window with no card side compares nothing from here on
+        // (`crate::windowskip`).
+        if !self.written_said.load(Ordering::Relaxed) {
+            self.written_said.store(true, Ordering::Relaxed);
         }
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -4396,6 +4580,11 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        let skip = self.window_skip(from, to);
+        if skip == crate::windowskip::SkipSame::Skip {
+            self.copy_window_skipping(from, to);
+            return to - from;
+        }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         if self.card.is_some() && from < to && crate::host::upcheck::on() {
@@ -4411,7 +4600,96 @@ impl Shadow {
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
+        if skip == crate::windowskip::SkipSame::Sample {
+            self.window_sample(from, to);
+        }
         to - from
+    }
+
+    /// What [`Shadow::copy`] of title memory `[from, to)` (inside the
+    /// buffer) does with the pages that hold what it last copied
+    /// (`crate::windowskip::mode`): only a window with no card side (in the
+    /// PC's memory or in mapped card memory, not in place) compares, and
+    /// not one shaders were said to write, whose bytes count as nothing to
+    /// compare with.
+    fn window_skip(&self, from: usize, to: usize) -> crate::windowskip::SkipSame {
+        use crate::windowskip::SkipSame;
+        if !self.window || self.card.is_some() || self.place.is_some() || from >= to {
+            return SkipSame::Off;
+        }
+        let mode = crate::windowskip::mode();
+        if mode != SkipSame::Off && self.written_said.load(Ordering::Relaxed) {
+            crate::windowskip::unknown(to - from);
+            crate::windowskip::taken(to - from, 0);
+            return SkipSame::Off;
+        }
+        mode
+    }
+
+    /// A window's prints (`Shadow::prints`), made at the first ask.
+    fn window_prints(&self) -> std::sync::MutexGuard<'_, Vec<u64>> {
+        let mut prints = self.prints.lock().unwrap_or_else(|e| e.into_inner());
+        if prints.is_empty() {
+            let n = crate::windowskip::prints_for(self.start as usize, (self.start + self.len) as usize);
+            prints.resize(n, 0);
+            crate::windowskip::prints_made(n);
+        }
+        prints
+    }
+
+    /// [`Shadow::copy`] of a window with no card side with
+    /// `VICTORY_WINDOW_SKIP_SAME=1`: title memory `[from, to)` (inside the
+    /// buffer) is read into memory of this thread's, and each run of 4 KiB
+    /// pages whose bytes are not what the window last copied goes into the
+    /// window's buffer (`crate::windowskip::copy`). A page that cannot be
+    /// read is read as zeros, as the copy without the switch stores it. The
+    /// prints stay locked until the bytes are in: a print is always that of
+    /// the bytes the buffer holds for its page.
+    fn copy_window_skipping(&self, from: usize, to: usize) {
+        thread_local! {
+            static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let mut prints = self.window_prints();
+        let mut tally = [0u64; 3];
+        let sent = READ.with(|read| {
+            crate::windowskip::copy(
+                (start, end),
+                (from, to),
+                &mut prints,
+                &mut read.borrow_mut(),
+                &mut tally,
+                |at, into| crate::host::copy_mapped(into.as_mut_ptr(), at as *const u8, into.len(), false),
+                |at, bytes| {
+                    // SAFETY: inside the mapping (`[at, at + len)` lies in
+                    // `[from, to)`, within the buffer); nothing else writes
+                    // a window's buffer while a refresh has it (no shader
+                    // writes one that compares, and a refresh is one
+                    // thread's).
+                    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(at - start), bytes.len()) };
+                    // After the bytes are in: a snapshot taken meanwhile is
+                    // not current.
+                    self.changed(at - start, at - start + bytes.len());
+                },
+            )
+        });
+        drop(prints);
+        crate::windowskip::tally_add(&tally);
+        crate::windowskip::taken(sent, (to - from).saturating_sub(sent));
+    }
+
+    /// `VICTORY_WINDOW_SKIP_SAME=sample`: of title memory `[from, to)` a
+    /// window with no card side has just copied, one 4 KiB page in 16 is
+    /// read again and compared with the window's prints, for the frame line
+    /// (`crate::windowskip::sample`). Nothing is left out.
+    fn window_sample(&self, from: usize, to: usize) {
+        let window = (self.start as usize, (self.start + self.len) as usize);
+        let mut tally = [0u64; 3];
+        crate::windowskip::sample(window, (from, to), &mut self.window_prints(), &mut tally, |at, into| {
+            crate::host::read_into(at as *const u8, into)
+        });
+        crate::windowskip::tally_add(&tally);
+        crate::windowskip::taken(to - from, 0);
     }
 
     /// Whether shaders read and write this copy in the card's own memory
