@@ -128,6 +128,7 @@ fn build() -> [u8; 32] {
             "VICTORY_EARLY_DEPTH",
             "VICTORY_D16_BITS",
             "VICTORY_NAN_GUARD",
+            "VICTORY_NAN_SCRUB",
             "VICTORY_SPILL_STRICT",
         ] {
             bytes.extend_from_slice(name.as_bytes());
