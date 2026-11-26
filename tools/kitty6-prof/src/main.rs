@@ -689,6 +689,7 @@ fn main() {
         sampler_busy_s: cost.busy_s,
         stall_s: cost.stall_s,
         walks: cost.walks,
+        exe: mods.first().map(|m| m.2.clone()).unwrap_or_default(),
         reused: cost.reused,
     };
     let an = analysis::analyze(&profile, &a.opts);

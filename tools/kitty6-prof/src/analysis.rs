@@ -43,6 +43,8 @@ pub struct Profile {
     /// Samples of threads that had not run since their last walk (counted
     /// again without suspending them).
     pub reused: u64,
+    /// The exe's file name ("victory.exe"): its frames are ours even unnamed.
+    pub exe: String,
 }
 
 impl Profile {
@@ -311,6 +313,7 @@ impl Stats {
 pub struct ThreadStats {
     pub tid: u32,
     pub group: String,
+    pub role: String,
     pub stats: Stats,
 }
 
@@ -318,6 +321,8 @@ pub struct Analysis {
     pub threads: Vec<ThreadStats>,
     /// Threads of one description together, busiest first.
     pub groups: Vec<(String, Stats)>,
+    /// Threads of one role together, most samples first.
+    pub roles: Vec<(String, Stats)>,
     pub all: Stats,
     pub focus: Option<(u64, Map, Map)>,
 }
@@ -347,7 +352,8 @@ pub fn analyze(p: &Profile, o: &Options) -> Analysis {
                 *fo.2.entry(leaf).or_default() += n;
             }
         }
-        threads.push(ThreadStats { tid: t.tid, group: t.group.clone(), stats: s });
+        let role = role_of(p, t);
+        threads.push(ThreadStats { tid: t.tid, group: t.group.clone(), role, stats: s });
     }
     let mut groups: HashMap<String, Stats> = HashMap::new();
     let mut all = Stats::default();
@@ -357,7 +363,131 @@ pub fn analyze(p: &Profile, o: &Options) -> Analysis {
     }
     let mut groups: Vec<_> = groups.into_iter().collect();
     groups.sort_by(|a, b| b.1.busy.cmp(&a.1.busy).then(b.1.samples.cmp(&a.1.samples)).then(a.0.cmp(&b.0)));
-    Analysis { threads, groups, all, focus }
+    let mut roles: HashMap<String, Stats> = HashMap::new();
+    for t in &threads {
+        roles.entry(t.role.clone()).or_default().merge(&t.stats);
+    }
+    let mut roles: Vec<_> = roles.into_iter().collect();
+    roles.sort_by(|a, b| b.1.samples.cmp(&a.1.samples).then(a.0.cmp(&b.0)));
+    Analysis { threads, groups, roles, all, focus }
+}
+
+/// Frames of code that is neither ours (the exe, symbol-named modules) nor
+/// the system's or the card driver's: the title's ("title.exe+0x10", bare
+/// addresses of code outside any module).
+pub fn is_foreign(frame: &str, exe: &str) -> bool {
+    if frame.starts_with("0x") {
+        return true;
+    }
+    match frame.find("+0x") {
+        Some(i) => {
+            let m = &frame[..i];
+            !m.eq_ignore_ascii_case(exe) && !is_system(frame) && !m.contains([':', ' '])
+        }
+        None => false,
+    }
+}
+
+/// Frames that start threads rather than say what they are for.
+fn is_runtime(frame: &str) -> bool {
+    is_system(frame)
+        || is_thread_start(frame)
+        || ["std::", "core::", "alloc::", "__scrt", "invoke_main", "mainCRTStartup", "__rust", "_beginthread", "thread_start"]
+            .iter()
+            .any(|p| frame.starts_with(p))
+}
+
+/// A thread's entry: the outermost frame of its own (not thread start-up or
+/// runtime) on the stack.
+pub fn entry_of<'a>(frames: &[&'a str]) -> &'a str {
+    frames
+        .iter()
+        .rev()
+        .find(|f| !is_runtime(f))
+        .or_else(|| frames.iter().rev().find(|f| !is_thread_start(f)))
+        .copied()
+        .unwrap_or("?")
+}
+
+/// What a thread is for. Its description where set ("victory-submit" is the
+/// submission thread, "victory-list-#" a list recorder, worker pools by
+/// name), else its entry function (the dominant one over its samples):
+/// title code -> "title threads", the card driver's -> "driver", a system
+/// thread pool -> by what its callbacks run, the CRT's main -> "main".
+pub fn role_of(p: &Profile, t: &ThreadData) -> String {
+    let mut entries: HashMap<&str, u64> = HashMap::new();
+    let (mut foreign, mut total, mut main) = (0u64, 0u64, false);
+    let mut runs: HashMap<&str, u64> = HashMap::new();
+    for (ids, n) in &t.stacks {
+        let frames = frames_of(p, ids);
+        total += n;
+        *entries.entry(entry_of(&frames)).or_default() += n;
+        if frames.iter().any(|f| is_foreign(f, &p.exe)) {
+            foreign += n;
+        }
+        main |= frames.iter().any(|f| f.contains("invoke_main") || f.contains("__scrt_common_main") || f.contains("mainCRTStartup"));
+        if let Some(f) = frames.iter().find(|f| !is_system(f)) {
+            *runs.entry(f).or_default() += n;
+        }
+    }
+    let entry = top(&entries, 1).first().map_or("?", |(k, _)| **k);
+    role_from(t.described.then_some(t.group.as_str()), entry, foreign as f64 / total.max(1) as f64, main, top(&runs, 1).first().map(|(k, _)| **k), &p.exe)
+}
+
+/// The rules of `role_of`, on what it found: the description, the dominant
+/// entry, the share of samples with title frames, whether it is the CRT's
+/// main thread, and the frame of ours it most often runs or waits in.
+pub fn role_from(described: Option<&str>, entry: &str, foreign: f64, main: bool, runs: Option<&str>, exe: &str) -> String {
+    if let Some(g) = described {
+        let l = g.to_ascii_lowercase();
+        let base = g.trim_end_matches('#').trim_end_matches(['-', '_', ' ']);
+        return if l.contains("submit") {
+            "submission".into()
+        } else if l.starts_with("victory-list") {
+            "list recorders".into()
+        } else if l.contains("rayon") {
+            "pool: rayon".into()
+        } else if g.ends_with('#') || ["victory-wide", "victory-land", "victory-under", "victory-pipelines", "pool", "worker"].iter().any(|p| l.starts_with(p)) {
+            format!("pool: {base}")
+        } else {
+            g.to_string()
+        };
+    }
+    if main {
+        return "main".into();
+    }
+    if foreign >= 0.3 || is_foreign(entry, exe) {
+        return "title threads".into();
+    }
+    if entry.contains("rayon_core") {
+        return "pool: rayon".into();
+    }
+    if is_card(entry) {
+        return format!("driver ({})", module_of(entry).unwrap_or("?").to_ascii_lowercase());
+    }
+    if is_system(entry) {
+        // A system thread pool: by what its callbacks run.
+        return match runs {
+            Some(f) if is_foreign(f, exe) => "title threads".into(),
+            Some(f) if is_card(f) => format!("driver ({})", module_of(f).unwrap_or("?").to_ascii_lowercase()),
+            Some(f) if !is_system(f) => format!("windows pool: {}", short_fn(f)),
+            _ => "windows pool".into(),
+        };
+    }
+    format!("unnamed: {}", short_fn(entry))
+}
+
+/// "a::b::c::closure$3" -> "a::b::c" (a closure is its function's).
+fn short_fn(f: &str) -> &str {
+    let mut s = f;
+    while let Some((head, last)) = s.rsplit_once("::") {
+        if last.starts_with("closure") || last.starts_with("{{closure}}") || last.starts_with("impl$") {
+            s = head;
+        } else {
+            break;
+        }
+    }
+    s
 }
 
 pub fn top<K: Ord, V: Copy + Ord>(map: &HashMap<K, V>, n: usize) -> Vec<(&K, V)> {
@@ -419,6 +549,41 @@ pub fn report(p: &Profile, a: &Analysis, o: &Options) -> String {
             pct(s.waiting(), s.samples),
             kinds_line(s)
         );
+    }
+    let _ = writeln!(r, "\n== roles (busy = running; waiting split by kind; self = leaf of busy samples)");
+    for (role, s) in &a.roles {
+        let _ = writeln!(
+            r,
+            "  {:<36} x{:<3} busy {:>5.1}% ({:>6.0} ms/s)  waiting {:>5.1}%  {}",
+            role,
+            s.threads,
+            pct(s.busy, s.samples),
+            p.ms_per_s(s.busy),
+            pct(s.waiting(), s.samples),
+            kinds_line(s)
+        );
+    }
+    for (role, s) in &a.roles {
+        let members: Vec<&str> = {
+            let mut m: Vec<&str> = a.threads.iter().filter(|t| &t.role == role).map(|t| t.group.as_str()).collect();
+            m.sort();
+            m.dedup();
+            m
+        };
+        let _ = writeln!(r, "\n== role {role} (x{}: {})", s.threads, members.join(", "));
+        let _ = writeln!(r, "  busy {:.1}%, waiting {:.1}%{}{}", pct(s.busy, s.samples), pct(s.waiting(), s.samples), if s.waiting() > 0 { ": " } else { "" }, kinds_line(s));
+        let _ = writeln!(r, "  -- self (busy):");
+        for (k, v) in top(&s.self_busy, 8) {
+            let _ = writeln!(r, "    {:>6.1}%  {:>7.1} ms/s  {k}", pct(v, s.samples), p.ms_per_s(v));
+        }
+        let _ = writeln!(r, "  -- inclusive:");
+        for (k, v) in top(&s.inclusive, 40).into_iter().filter(|(k, _)| !is_runtime(k)).take(8) {
+            let _ = writeln!(r, "    {:>6.1}%  {:>7.1} ms/s  {k}", pct(v, s.samples), p.ms_per_s(v));
+        }
+        if !s.waits.is_empty() {
+            let _ = writeln!(r, "  -- waits by site:");
+            waits_table(&mut r, p, s, 6, "    ");
+        }
     }
     let _ = writeln!(r, "\n== all threads: what they run or wait in (first frame of ours)");
     for (k, v) in top(&a.all.what, o.top) {
@@ -571,7 +736,56 @@ pub mod tests {
                 .collect();
             out.push(ThreadData { tid, group: group.to_string(), described: !group.starts_with('('), stacks });
         }
-        Profile { pid: 1, seconds: 1.0, hz: 100.0, rounds: 100, names, threads: out, sampler_cpu_s: 0.01, sampler_busy_s: 0.01, stall_s: 0.0, walks: 1, reused: 0 }
+        Profile { pid: 1, seconds: 1.0, hz: 100.0, rounds: 100, names, threads: out, sampler_cpu_s: 0.01, sampler_busy_s: 0.01, stall_s: 0.0, walks: 1, reused: 0, exe: "victory.exe".into() }
+    }
+
+    #[test]
+    fn roles_from_descriptions() {
+        let r = |g: &str| role_from(Some(g), "x", 0.0, false, None, "victory.exe");
+        assert_eq!(r("victory-submit"), "submission");
+        assert_eq!(r("victory-list-#"), "list recorders");
+        assert_eq!(r("victory-wide-#"), "pool: victory-wide");
+        assert_eq!(r("uploads ahead #"), "pool: uploads ahead");
+        assert_eq!(r("victory-relay"), "victory-relay");
+    }
+
+    #[test]
+    fn roles_from_entries() {
+        let r = |entry: &str, foreign: f64, main: bool, runs: Option<&str>| role_from(None, entry, foreign, main, runs, "victory.exe");
+        assert_eq!(r("victory::main", 0.0, true, None), "main");
+        assert_eq!(r("default.xex+0x1200", 1.0, false, None), "title threads");
+        assert_eq!(r("victory_hle::thread::start", 0.6, false, None), "title threads");
+        assert_eq!(r("rayon_core::registry::main_loop", 0.0, false, None), "pool: rayon");
+        assert_eq!(r("nvwgf2umx.dll+0x77", 0.0, false, None), "driver (nvwgf2umx)");
+        assert_eq!(r("ntdll!TppWorkerThread", 0.0, false, None), "windows pool");
+        assert_eq!(r("ntdll!TppWorkerThread", 0.0, false, Some("nvwgf2umx.dll+0x5")), "driver (nvwgf2umx)");
+        assert_eq!(r("app::worker::closure$2", 0.0, false, None), "unnamed: app::worker");
+        // The exe's own unnamed frames are not the title's.
+        assert!(!is_foreign("victory.exe+0x10", "victory.exe"));
+        assert!(is_foreign("0x7ff612340000", "victory.exe"));
+        assert!(!is_foreign("ntdll.dll+0x10", "victory.exe"));
+    }
+
+    #[test]
+    fn entries_skip_thread_start_up() {
+        let s = ["app::work", "app::worker::closure$0", "std::sys::backtrace::__rust_begin_short_backtrace", "core::ops::function::FnOnce::call_once", "std::sys::thread::windows::impl$0::new::thread_start", "kernel32!BaseThreadInitThunk", "ntdll!RtlUserThreadStart"];
+        assert_eq!(entry_of(&s), "app::worker::closure$0");
+        let tp = ["ntdll!NtWaitForWorkViaWorkerFactory", "ntdll!TppWorkerThread", "kernel32!BaseThreadInitThunk", "ntdll!RtlUserThreadStart"];
+        assert_eq!(entry_of(&tp), "ntdll!TppWorkerThread");
+    }
+
+    #[test]
+    fn roles_group_threads() {
+        let p = profile(vec![
+            (1, "victory-list-#", vec![(vec!["victory_gpu::list::record", "victory_gpu::list::worker"], 10)]),
+            (2, "victory-list-#", vec![(vec!["victory_gpu::list::record", "victory_gpu::list::worker"], 10)]),
+            (3, "(unnamed 3)", vec![(vec!["default.xex+0x10", "kernel32!BaseThreadInitThunk", "ntdll!RtlUserThreadStart"], 10)]),
+        ]);
+        let a = analyze(&p, &Options::default());
+        let roles: Vec<(&str, usize)> = a.roles.iter().map(|(r, s)| (r.as_str(), s.threads)).collect();
+        assert_eq!(roles, vec![("list recorders", 2), ("title threads", 1)]);
+        let r = report(&p, &a, &Options::default());
+        assert!(r.contains("== role list recorders (x2: victory-list-#)"), "{r}");
     }
 
     #[test]
