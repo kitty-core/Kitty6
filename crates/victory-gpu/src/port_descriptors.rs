@@ -347,7 +347,10 @@ pub fn import(name: &str, address: usize) -> usize {
         "memmove" => (1, shift as *const () as usize),
         _ => return address,
     };
-    if !on() {
+    // Opt-in (`VICTORY_PORT_COPIES=1`, after upstream 4aeb6d08): every
+    // memcpy and memmove of the title's goes through the hook, and the
+    // fallback finds what it would have marked.
+    if !on() || !std::env::var("VICTORY_PORT_COPIES").is_ok_and(|v| v.trim() == "1") {
         return address;
     }
     REAL[which].store(address, Relaxed);
