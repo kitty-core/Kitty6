@@ -227,12 +227,11 @@ fn resolve_card_limits(
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
-        let env_mb = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
         let vram_budget = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
         let (mut min_bytes, max_bytes) = resolve_card_limits(
             vram_budget,
-            env_mb("VICTORY_CARD_BUFFERS_MIN_MB"),
-            env_mb("VICTORY_CARD_BUFFERS_MB"),
+            std::env::var("VICTORY_CARD_BUFFERS_MIN_MB").ok().as_deref().and_then(parse_mib),
+            explicit_card_buffers_mb(),
         );
         // `VICTORY_CARD_BUFFERS_MIN_KB` (after fxceless c36971b2) says the
         // least size in KiB, so that it can go under 1 MiB: 64 is every title
@@ -255,6 +254,18 @@ fn card_limits() -> (u64, u64) {
         );
         (min_bytes, max_bytes)
     })
+}
+
+/// `VICTORY_CARD_BUFFERS_MB` as read once, for both the limit and the
+/// reservation ([`card_room_kept`]).
+fn explicit_card_buffers_mb() -> Option<u64> {
+    static MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| std::env::var("VICTORY_CARD_BUFFERS_MB").ok().as_deref().and_then(parse_mib))
+}
+
+/// A number of MiB from a switch's value. Pure, for testing.
+fn parse_mib(value: &str) -> Option<u64> {
+    value.trim().parse().ok()
 }
 
 /// Bytes alive of copies' card sides, and of their "before" twins.
@@ -294,6 +305,19 @@ fn card_room_kept_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_ROOM_FOR_BUFFERS").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_CARD_RESERVE_BUDGETS=1` (off by default; `-Rtx4070` in
+/// scripts\play.ps1 sets it outside `-Safe`): the texture queue keeps room
+/// for an explicit `VICTORY_CARD_BUFFERS_MB` in full, not at most 1 GiB, and
+/// for what `VICTORY_CARD_WINDOWS_MB` has not taken yet; windows then go to
+/// the card up to 97 hundredths of its budget, as buffer copies do, not 80.
+/// Without it textures can fill the room before the copies arrive and leave
+/// them in the PC's memory. Ported from TaynanGT/Vice-Tay PR #69 (266ba60a,
+/// author zzzz-26; made opt-in by f3dfb5b9, author TaynanGT).
+fn reserve_card_budgets() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_RESERVE_BUDGETS").is_some_and(|v| v == "1"))
+}
+
 /// Title buffers big enough for a copy in the card's memory that were
 /// turned down for want of room, since the start, and their bytes: their
 /// copies stay in the PC's memory for as long as the title keeps the
@@ -312,8 +336,38 @@ pub(crate) fn card_room_kept() -> u64 {
     // 5 GB that never came (941 MB in 97 copies after fifteen minutes), and
     // no texture was made any more with 5 GB of the card free (session
     // play-1125-0127: 1,453 passes refused, the ground and people black).
+    let (buffers, windows) = reservation_limits(
+        card_limits().1,
+        explicit_card_buffers_mb().is_some(),
+        window_card_most(),
+        reserve_card_budgets(),
+    );
+    remaining_card_room(
+        buffers,
+        CARD_BYTES[0].load(Ordering::Relaxed),
+        CARD_REFUSED[1].load(Ordering::Relaxed),
+        windows,
+        WINDOW_CARD_BYTES.load(Ordering::Relaxed),
+    )
+}
+
+/// The room kept for buffer copies and for windows ([`card_room_kept`]):
+/// buffers at most 1 GiB and no windows, unless `reserve`
+/// ([`reserve_card_budgets`]) and the buffer budget was asked for. Pure.
+fn reservation_limits(buffers: u64, explicit_buffers: bool, windows: u64, reserve: bool) -> (u64, u64) {
     const SEEN: u64 = 1 << 30;
-    card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+    if reserve {
+        (if explicit_buffers { buffers } else { buffers.min(SEEN) }, windows)
+    } else {
+        (buffers.min(SEEN), 0)
+    }
+}
+
+/// What is left of the two reservations. Pure.
+fn remaining_card_room(buffers: u64, used: u64, refused: u64, windows: u64, window_used: u64) -> u64 {
+    buffers
+        .saturating_sub(used.saturating_add(refused))
+        .saturating_add(windows.saturating_sub(window_used))
 }
 
 /// The copies in the card's memory.
@@ -501,9 +555,9 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
 /// unless a shader does declare a write to it one day.
 ///
 /// A window goes to the card while there is room under this number and
-/// while a fifth of the card's budget is free, as title buffers do
-/// (`card_for`): textures keep their room, and once they have filled the
-/// card later windows stay where they are. The CPU's side stays in the PC's
+/// while a fifth of the card's budget is free (97 hundredths are used with
+/// [`reserve_card_budgets`], whose room was kept): textures keep their room,
+/// and once they have filled the card later windows stay where they are. The CPU's side stays in the PC's
 /// memory, so the memory shared with the card does not shrink by this
 /// alone; what moves is what shaders read.
 fn window_card_most() -> u64 {
@@ -599,7 +653,7 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used.saturating_add(size) > window_usage_limit(budget, reserve_card_budgets() && card_room_kept_on())
     {
         return None;
     }
@@ -612,6 +666,11 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
     }
     buffer
+}
+
+/// The most of the card's budget in use under which a window goes there. Pure.
+fn window_usage_limit(budget: u64, reserved: bool) -> u64 {
+    if reserved { budget / 100 * 97 } else { budget / 10 * 8 }
 }
 
 /// What went up, by send: its number, and the offsets, in order and joined
@@ -6217,6 +6276,24 @@ mod window_tests {
         WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
         tail_of, window_of, window_victims,
     };
+
+    #[test]
+    fn only_the_explicit_switch_reserves_full_budgets() {
+        use super::{parse_mib, remaining_card_room, reservation_limits, window_usage_limit};
+        const MIB: u64 = 1 << 20;
+        assert_eq!(reservation_limits(1536 * MIB, true, 1024 * MIB, false), (1024 * MIB, 0));
+        assert_eq!(reservation_limits(1536 * MIB, true, 1024 * MIB, true), (1536 * MIB, 1024 * MIB));
+        // A missing or unreadable budget keeps the 1 GiB cap.
+        assert_eq!(parse_mib(" 1536 "), Some(1536));
+        assert_eq!(parse_mib("not a number"), None);
+        assert_eq!(reservation_limits(2048 * MIB, false, 1024 * MIB, true), (1024 * MIB, 1024 * MIB));
+        assert_eq!(reservation_limits(512 * MIB, false, 0, false), (512 * MIB, 0));
+        assert_eq!(window_usage_limit(1_099, false), 872);
+        assert_eq!(window_usage_limit(1_099, true), 970);
+        assert_eq!(remaining_card_room(1536 * MIB, 512 * MIB, 0, 1024 * MIB, 256 * MIB), 1792 * MIB);
+        assert_eq!(remaining_card_room(512 * MIB, 256 * MIB, 1024 * MIB, 1024 * MIB, 256 * MIB), 768 * MIB);
+        assert_eq!(remaining_card_room(0, u64::MAX, 1, 0, 0), 0);
+    }
 
     #[test]
     fn window_budget_evicts_oldest_only_until_it_fits() {

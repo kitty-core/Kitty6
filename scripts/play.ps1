@@ -7,6 +7,10 @@
 # -Lean         for a PC with 32 GB of RAM or less and a 12-16 GB card: the Series S profile
 #               (7.7 GB of title memory, not 13.5), large textures a level smaller, small buffers on the
 #               card, the residency budgets, warnings-only logging (as codec-d/cool_fox's launcher)
+# -Rtx4070      opt-in RTX 4070 (12 GB) / 8-core preset, meant beside -Lean (TaynanGT/Vice-Tay PR #69):
+#               only what -Lean and the defaults don't already set: 4 landing threads and 3 pipeline
+#               workers fixed, and the texture queue keeping the card buffer/window budgets in full
+#               (VICTORY_CARD_RESERVE_BUDGETS=1, not under -Safe)
 # -Probe        a row a second of what the PC is short of, in %LOCALAPPDATA%\victory\probes
 #               (docs/probes.md; read it back with target\diag\victory.exe probe-report <file>)
 # -Overlay      the Kitty6 Overlay over the game (target\<build>\kitty6-overlay.exe; F6 hides/shows it,
@@ -35,6 +39,7 @@ param(
     [switch]$Probe,
     [switch]$Overlay,
     [switch]$Lean,
+    [switch]$Rtx4070,
     [double]$Fps = -1,
     [ValidateSet('', 'Low', 'Medium', 'High')][string]$Quality = '',
     [switch]$Drive,
@@ -85,6 +90,21 @@ if ($Lean) {
     # No device-removal breadcrumbs: in a diagnostics build they also keep a book of
     # up to 400,000 released resources.
     $settings.Remove('VICTORY_D3D12_DRED')
+}
+if ($Rtx4070) {
+    # From TaynanGT/Vice-Tay PR #69 (266ba60a, zzzz-26) and f3dfb5b9 (TaynanGT), for an RTX 4070
+    # with an 8-core Ryzen 7 7800X3D. Their 8 list threads, 6 under-write threads and 1 mapping
+    # thread are already our defaults/base settings, and their 64 KiB / 1536 MB / 1024 MB card
+    # budgets are -Lean's, so only these differ: landing threads fixed at 4 (ours: a quarter of the
+    # logical processors, 1-4) and 3 pipeline workers (ours: two thirds of them, 2-16), leaving
+    # the cores to the title.
+    $settings.VICTORY_LAND_THREADS = '4'; $settings.VICTORY_PIPELINE_WORKERS = '3'
+    if (-not $Safe) {
+        # The explicit buffer budget kept in full for card copies (not 1 GiB at most), the window
+        # budget kept too, and windows to the card up to 97 % of its budget instead of 80 %.
+        $settings.VICTORY_CARD_RESERVE_BUDGETS = '1'
+    }
+    if (-not $Lean) { Write-Host '-Rtx4070 is meant beside -Lean (its card budgets are what the reservation keeps).' }
 }
 if ($Probe) {
     $settings.VICTORY_PROBE = Join-Path $env:LOCALAPPDATA 'victory\probes'

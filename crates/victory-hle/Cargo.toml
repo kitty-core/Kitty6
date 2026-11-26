@@ -50,6 +50,8 @@ windows-core = { workspace = true, optional = true }
 tempfile.workspace = true
 
 [features]
+# Rust allocations through mimalloc (victory-gpu's `mimalloc`).
+mimalloc = ["victory-gpu/mimalloc"]
 # Debugging switches (scripted keys and the like).
 diagnostics = ["victory-gpu/diagnostics", "victory-loader/diagnostics", "dep:windows", "dep:windows-core"]
 
