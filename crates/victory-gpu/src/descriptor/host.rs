@@ -1517,6 +1517,10 @@ pub(crate) fn near_heaps(va: u64) -> String {
     text
 }
 
+/// Dynamic slots given out and given back since the start, for the log of
+/// a failed search (their rate over time is what a frame takes).
+static GIVEN: [std::sync::atomic::AtomicU64; 2] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
 /// Which dynamic slots are taken, a bit each, searched a word at a time.
 ///
 /// Why: a slot at a time, a table that found no run walked the whole ring
@@ -1987,6 +1991,8 @@ impl HostHeap {
                         free = self.free.load(std::sync::atomic::Ordering::Relaxed),
                         longest = taken.longest_free(),
                         slots = end,
+                        given_out = GIVEN[0].load(std::sync::atomic::Ordering::Relaxed),
+                        given_back = GIVEN[1].load(std::sync::atomic::Ordering::Relaxed),
                         "dynamic descriptor slots: a table found no run of free slots"
                     );
                 }
@@ -2005,6 +2011,7 @@ impl HostHeap {
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken.set(first, first + n, true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
+        GIVEN[0].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
     }
@@ -2879,6 +2886,7 @@ impl HostHeap {
         let end = (at + n).min(self.dynamic) as usize;
         if (at as usize) < end {
             let given = guard.1.set(at as usize, end, false) as u32;
+            GIVEN[1].fetch_add(u64::from(given), std::sync::atomic::Ordering::Relaxed);
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
         }

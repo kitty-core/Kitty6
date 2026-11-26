@@ -198,6 +198,33 @@ pub(crate) struct Detached {
     _state: crate::draw::State,
 }
 
+/// Whether the descriptor tables of a flight's lists go back when it has
+/// landed, not with its host lists after [`crate::host`]'s bury lag
+/// (`VICTORY_EARLY_TABLES=1`).
+///
+/// Why: the lag (64 submissions, about four frames) is for memory and lists
+/// the card may still read; a landed flight's fence is done, so its slots
+/// are not read again. Held with the lists, about six frames of tables held
+/// the 2^18 dynamic slots of an NVIDIA host (239,000 taken, 38,000 a frame;
+/// run ds-4) and 2,200 tables a frame were refused.
+#[cfg(windows)]
+fn early_tables() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_TABLES").is_some_and(|v| v == "1"))
+}
+
+/// A flight has landed: with [`early_tables`], its lists' descriptor table
+/// slots go back now.
+#[cfg(windows)]
+pub(crate) fn tables_early(lists: &mut [Detached]) {
+    if !early_tables() {
+        return;
+    }
+    for list in lists {
+        list._state.tables_done();
+    }
+}
+
 #[cfg(windows)]
 impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
