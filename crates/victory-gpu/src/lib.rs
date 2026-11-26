@@ -28,6 +28,8 @@ mod capture;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod devmenu;
 #[cfg(windows)]
+pub mod kitty6;
+#[cfg(windows)]
 mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]

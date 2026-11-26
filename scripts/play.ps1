@@ -44,6 +44,7 @@ param(
     [ValidateSet('', 'X', 'S')][string]$Console = '',
     [string]$Output = '',
     [switch]$F8Timeline,
+    [switch]$NoMods,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{}
 )
@@ -95,6 +96,11 @@ elseif ($Fps -gt 0) { $settings.VICTORY_FRAME_INTERVAL_MS = (1000.0 / $Fps).ToSt
 if ($Panel) { $settings.VICTORY_PANEL = '1' }
 if ($Dev) { $settings.VICTORY_DEV = $Dev }
 if ($Output) { $settings.VICTORY_OUTPUT = $Output }
+# Kitty6 renderer mods: the repository's mods\*.k6mod rule files (crates/victory-gpu/src/kitty6.rs).
+if (-not $NoMods) {
+    $modFiles = @(Get-ChildItem -Path (Join-Path $PSScriptRoot '..\mods') -Filter '*.k6mod' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    if ($modFiles.Count) { $settings.VICTORY_MODS = $modFiles -join ';' }
+}
 if ($F8Timeline) { $settings.VICTORY_TIMELINE = 'key,3,' + (Join-Path $env:LOCALAPPDATA 'victory\logs\f8.json') }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 if ($Drive) {

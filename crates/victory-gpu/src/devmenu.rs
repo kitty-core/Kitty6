@@ -44,10 +44,21 @@ pub(crate) enum Item {
     Snapshot,
     Autopilot,
     Mark,
+    /// Kitty6 renderer mods off and on ([`crate::kitty6`]).
+    Mods,
 }
 
-const ITEMS: [Item; 8] =
-    [Item::Panel, Item::Footage, Item::Rate, Item::Shot, Item::Timeline, Item::Snapshot, Item::Autopilot, Item::Mark];
+const ITEMS: [Item; 9] = [
+    Item::Panel,
+    Item::Footage,
+    Item::Rate,
+    Item::Shot,
+    Item::Timeline,
+    Item::Snapshot,
+    Item::Autopilot,
+    Item::Mark,
+    Item::Mods,
+];
 
 impl Item {
     fn named(name: &str) -> Option<Item> {
@@ -64,6 +75,7 @@ impl Item {
             Item::Snapshot => "snapshot",
             Item::Autopilot => "autopilot",
             Item::Mark => "mark",
+            Item::Mods => "mods",
         }
     }
 }
@@ -240,6 +252,10 @@ fn run(item: Item) {
             tracing::warn!(mark = n, at = seconds(), "mark (dev menu)");
             SHOT.store(true, Ordering::Relaxed);
         }
+        Item::Mods => {
+            let on = crate::kitty6::toggle();
+            tracing::warn!(on, at = seconds(), report = %crate::kitty6::report(), "mods (dev menu)");
+        }
     }
     CHANGED.store(true, Ordering::Relaxed);
 }
@@ -299,6 +315,7 @@ pub(crate) fn lines() -> Vec<String> {
             Item::Snapshot => "NUMBERS TO LOG".to_owned(),
             Item::Autopilot => PILOTS[usize::from(AUTOPILOT.load(Ordering::Relaxed)) % PILOTS.len()].to_owned(),
             Item::Mark => format!("{} SO FAR", MARKS.load(Ordering::Relaxed)),
+            Item::Mods => format!("{} {} RULES", on(crate::kitty6::on()), crate::kitty6::rules().len()),
         };
         let cursor = if i == at { '>' } else { ' ' };
         out.push(format!("{cursor}{:<10}{value}", item.name().to_ascii_uppercase()));

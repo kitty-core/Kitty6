@@ -1,0 +1,11 @@
+# Kitty6 renderer mods: rules of our own, read by crates/victory-gpu/src/kitty6.rs.
+# A rule names a translated shader by its runtime hash (as the log and
+# `victory replay --timing detailed` print it) and says what to do with the
+# draws and dispatches that use it. Nothing of the title is in this file.
+#
+#   <16 hex digits> skip              never run
+#   <16 hex digits> every <n>         run in one frame of n (results stay in place between)
+#   <16 hex digits> every <n> at <k>  ... in frames whose number % n == k
+#
+# scripts\play.ps1 passes every mods\*.k6mod unless -NoMods. In game, F4 then
+# the MODS item turns all rules off and on (VICTORY_DEV=<s>:mods in a script).
