@@ -975,6 +975,10 @@ pub(crate) struct CopyLocation {
     footprint: crate::resource::PlacedFootprint,
 }
 
+/// Copies to or from a level a host copy leaves out, since the start
+/// ([`crate::resource::host_subresource`]).
+pub(crate) static LEFT_OUT_LEVELS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Texture to texture on the GPU; buffer to texture through an upload
 /// buffer filled at submission. Texture to buffer (read back) is not done
 /// yet.
@@ -1139,9 +1143,25 @@ extern "system" fn copy_texture_region(
             SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
         }
+        // Host copies that begin at a lower level than the title's texture
+        // ([`crate::resource::host_subresource`]) number their levels from
+        // there: a copy to or from a level they leave out is left out.
+        let at = |location: &CopyLocation| -> Option<u64> {
+            if location.kind == FOOTPRINT {
+                return Some(location.footprint.offset);
+            }
+            let index = crate::resource::host_subresource(location.resource, location.footprint.offset as u32)?;
+            Some((location.footprint.offset & !0xffff_ffff) | u64::from(index))
+        };
+        let (Some(to_at), Some(from_at)) = (at(&dst), at(&src)) else {
+            LEFT_OUT_LEVELS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        };
+        from.footprint.offset = if src.kind == FOOTPRINT { from.footprint.offset } else { from_at };
         ensure_state(list, dst.resource, COPY_DEST);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
+        to_location.footprint.offset = to_at;
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
         {

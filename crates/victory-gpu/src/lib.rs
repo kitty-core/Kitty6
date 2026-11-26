@@ -48,6 +48,8 @@ mod host;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
+mod agility;
+#[cfg(windows)]
 mod inplace;
 #[cfg(windows)]
 mod port;
@@ -94,6 +96,10 @@ pub mod signature;
 mod switch;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod ab;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod probe;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod telemetry;
 #[cfg(windows)]
 mod tdr;
 #[cfg(windows)]

@@ -84,7 +84,12 @@ scripts\play.ps1 -Exe <path of your copy's executable>
 ```
 
 `scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+something is wrong. On a PC with 32 GB of RAM or less, `-Lean` runs the Series
+S profile with the memory-saving switches, and `-Probe` records a row a second of
+what the PC is short of (paging, the card's memory, pipelines, one busy thread):
+[docs/probes.md](docs/probes.md). `-Overlay` puts the Kitty6 Overlay, a live HUD of the
+same numbers, over the game window (build it with `cargo build --profile diag -p kitty6-overlay`;
+F6 hides and shows it). `-RayTracing` turns the title's ray-traced indirect light on.
 
 On a hybrid-graphics PC, the runtime and offline pipeline checks prefer a
 high-performance adapter with Shader Model 6.6. The runtime logs its adapter

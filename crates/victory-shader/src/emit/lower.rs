@@ -360,6 +360,11 @@ struct Lower<'a> {
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
     wave_base: Option<V>,
+    /// With [`with_pair_meetings`]: the first of the LDS dwords (one per console wave of the
+    /// group) that count the arrivals at [`Self::pair_sync`], and this thread's dword's
+    /// address, made in the entry block.
+    pair_meet: Option<u32>,
+    pair_counter: Option<V>,
     /// A partial final group (`USER_DISPATCH_THREADS_X`) whose console waves are two host
     /// waves: the threads past the count stay for the exchange's group barriers, so they
     /// cannot leave at entry; this says which threads the console launched, and memory,
@@ -1444,6 +1449,46 @@ thread_local! {
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`with_pair_meetings`].
+    static PAIR_MEETINGS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `VICTORY_WAVE64_EMULATE`: a console wave64 compute program that no other form brings to
+/// 32-lane waves runs as two host waves of 32 per console wave anyway. Its per-lane branches
+/// around cross-lane code and shared memory are taken by the whole console wave, as the
+/// console takes them, with the lanes that would not go in masked off; its cross-lane
+/// operations (ballots, lane reads, reductions and prefixes, masks as numbers) and its shared
+/// memory accesses are exchanged and ordered between the two halves through LDS. In a group of
+/// several console waves the halves meet on a counter of their own instead of a group barrier
+/// ([`with_pair_meetings`]), since the other console waves of the group go their own way.
+/// On by default only when the host runs no 64-lane waves (`WaveLaneCountMax` under 64, as on
+/// NVIDIA), where such a program would otherwise have no pipeline at all; `0` turns it off.
+/// Only tried after every other form, so no program that translated before changes.
+pub(super) fn wave64_emulate_on() -> bool {
+    wave64_emulate(host_max_wave(), std::env::var("VICTORY_WAVE64_EMULATE").ok().as_deref())
+}
+
+/// [`wave64_emulate_on`] for a host whose widest wave is `host` lanes (0: not known) and the
+/// switch's value. Pure, for testing.
+pub(super) fn wave64_emulate(host: u32, value: Option<&str>) -> bool {
+    match value {
+        Some("0") => false,
+        // (the translator splits console waves only for hosts of 32-lane waves)
+        Some("1") => host == 32,
+        _ => host != 0 && host < 64,
+    }
+}
+
+/// Runs `f` with the two host waves of a console wave meeting on an LDS counter of their own
+/// ([`Lower::pair_sync`]) where they would meet at a group barrier, for a program whose
+/// per-lane branches are taken wave-wide in a group of several console waves: the other
+/// console waves of the group may not go into such a branch, so a group barrier there would
+/// wait for threads that never come. Only for groups of whole console waves.
+pub(super) fn with_pair_meetings<R>(f: impl FnOnce() -> R) -> R {
+    let was = PAIR_MEETINGS.replace(true);
+    let r = f();
+    PAIR_MEETINGS.set(was);
+    r
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -1820,6 +1865,8 @@ impl<'a> Lower<'a> {
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
+        // with `with_pair_meetings`: the first per-console-wave meeting counter (`pair_meet`)
+        let mut pair_meet: Option<u32> = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -1947,6 +1994,11 @@ impl<'a> Lower<'a> {
                 // console threads go to host waves in the order the waves take them (`wave_base`)
                 halves = Some(s.lds_dwords);
                 s.lds_dwords += 1;
+                if PAIR_MEETINGS.get() && group > 64 && group % 64 == 0 && (exchange.is_some() || split_lds) {
+                    // a counter per console wave for the meetings of its two host waves
+                    pair_meet = Some(s.lds_dwords);
+                    s.lds_dwords += group / 64;
+                }
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
@@ -2115,6 +2167,8 @@ impl<'a> Lower<'a> {
             clane: None,
             pair: None,
             halves,
+            pair_meet,
+            pair_counter: None,
             partial_active: None,
             wave_base: None,
             flat: None,
@@ -2738,6 +2792,19 @@ impl<'a> Lower<'a> {
 
     fn run(mut self, counted: bool) -> Result<Lowered, Stop> {
         let p = self.x.p;
+        if self.pair_meet.is_some() && self.s.lds_dwords > 32768 / 4 {
+            // (the exchange and meeting dwords past a program that uses all 32 KB the host
+            // gives a group: no room for them)
+            return Err(unsupported(0, "two host waves per console wave with no LDS left to exchange through"));
+        }
+        if self.pair_meet.is_some() {
+            // (a meeting may stand in the entry block, which `Module::split_before` cannot
+            // split: the code "made in the entry block" goes to the block after it)
+            let body = self.s.m.new_block();
+            let original = self.s.entry;
+            self.s.m.terminate(original, Term::Br(body));
+            self.s.entry = body;
+        }
         if counted {
             // Before anything else, so that wave counts, reads of the first
             // lane and stores know only the lanes that run.
@@ -4709,6 +4776,92 @@ impl<'a> Lower<'a> {
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
+    /// The two host waves of this thread's console wave meet in `block`: what either wrote to
+    /// LDS before is seen by both after. A group barrier, or with `pair_meet` the pair's own
+    /// meeting ([`Self::pair_sync`]).
+    fn meet(&mut self, block: usize) {
+        if self.pair_meet.is_some() {
+            self.pair_sync(block);
+        } else {
+            self.group_sync(block);
+        }
+    }
+
+    /// This thread's meeting counter (`pair_meet`), set to 0 in the entry block before any
+    /// thread of the group can arrive at a meeting (a group barrier there, which every thread
+    /// runs).
+    fn pair_counter(&mut self) -> V {
+        if let Some(v) = self.pair_counter {
+            return v;
+        }
+        let slot = self.pair_meet.expect("with pair meetings");
+        let e = self.s.entry;
+        let thread = self.console_thread();
+        let six = self.s.m.i32(6);
+        let wave = self.s.m.bin(e, Bin::LShr, thread, six);
+        let base = self.s.m.i32(slot);
+        let index = self.s.m.bin(e, Bin::Add, base, wave);
+        let lds = self.s.lds();
+        let ptr = self.s.m.element(e, lds, index);
+        let zero = self.s.m.i32(0);
+        self.s.m.store(e, ptr, zero);
+        self.group_sync(e);
+        self.pair_counter = Some(ptr);
+        ptr
+    }
+
+    /// The meeting of the two host waves of one console wave without the rest of the group: a
+    /// barrier needs every thread of the group, and in a group of several console waves the
+    /// others may be elsewhere (a branch this console wave takes wave-wide and they do not).
+    /// Each of the 64 threads adds 1 to the console wave's counter, then waits until the count
+    /// reaches the next multiple of 64: every thread has arrived. A thread that went on to the
+    /// next meeting adds to the next 64, which does not let anyone still waiting at this one
+    /// past early, and no thread can add twice before every thread has added once. LDS fences
+    /// before and after order the accesses around it. The wait is a loop around an atomic
+    /// read, placed in `block` where it stands: what `block` held so far goes to a block of its
+    /// own before the loop ([`super::bitcode::Module::split_before`]), and code added to `block`
+    /// later runs after it. A thread that waits for 2^20 rounds goes on rather than hang the
+    /// GPU (both halves always arrive where this is used: only where every lane runs).
+    fn pair_sync(&mut self, block: usize) {
+        let ptr = self.pair_counter();
+        let (void, i32t) = (self.s.t.void, self.s.t.i32);
+        let pre = self.s.m.split_before(block);
+        // (IR blocks that started in `block` now start in `pre`: branches made later go there)
+        for b in self.block.iter_mut().flatten() {
+            if *b == block {
+                *b = pre;
+            }
+        }
+        for e in self.edges.values_mut() {
+            if *e == block {
+                *e = pre;
+            }
+        }
+        let fence = self.s.m.i32(8);
+        self.s.op(pre, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+        let one = self.s.m.i32(1);
+        let old = self.s.m.atomic(pre, Rmw::Add, ptr, one);
+        let down = self.s.m.i32(!63);
+        let k64 = self.s.m.i32(64);
+        let round = self.s.m.bin(pre, Bin::And, old, down);
+        let target = self.s.m.bin(pre, Bin::Add, round, k64);
+        let wait = self.s.m.new_block();
+        self.s.m.terminate(pre, Term::Br(wait));
+        let tries = self.s.m.phi(wait, i32t);
+        let zero = self.s.m.i32(0);
+        let now = self.s.m.atomic(wait, Rmw::Or, ptr, zero);
+        let left = self.s.m.bin(wait, Bin::Sub, now, target);
+        let early = self.s.m.cmp(wait, pred::SLT, left, zero);
+        let next = self.s.m.bin(wait, Bin::Add, tries, one);
+        let limit = self.s.m.i32(1 << 20);
+        let more = self.s.m.cmp(wait, pred::IULT, next, limit);
+        let again = self.s.m.bin(wait, Bin::And, early, more);
+        self.s.m.set_phi(tries, vec![(zero, pre), (next, wait)]);
+        self.s.m.terminate(wait, Term::CondBr(again, wait, block));
+        let fence = self.s.m.i32(8);
+        self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+    }
+
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
     /// (lower half's, upper half's). A group with no upper half gets 0 for it.
     fn exchange_halves(&mut self, at: usize, mine: V) -> (V, V) {
@@ -4738,7 +4891,7 @@ impl<'a> Lower<'a> {
         let lds = self.s.lds();
         let ptr = self.s.m.element(at, lds, index);
         self.s.m.store(at, ptr, mine);
-        self.group_sync(at);
+        self.meet(at);
         let one = self.s.m.i32(1);
         let k1 = self.s.m.bin(at, Bin::Add, pair, one);
         let p0 = self.s.m.element(at, lds, pair);
@@ -4746,7 +4899,7 @@ impl<'a> Lower<'a> {
         let lo = self.s.m.load(at, p0);
         let hi = self.s.m.load(at, p1);
         // the slots are written again only after every thread read them
-        self.group_sync(at);
+        self.meet(at);
         (lo, hi)
     }
 
@@ -5914,9 +6067,8 @@ impl<'a> Lower<'a> {
         {
             // the two host waves of a console wave meet before each LDS access: what the other
             // half wrote is visible, and what it still reads is not overwritten
-            let mode = self.s.m.i32(meeting_mode());
-            let void = self.s.t.void;
-            self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            let c = self.cur;
+            self.meet(c);
         }
         // The structure builder's threads take turns through atomics (a tree
         // built from its leaves up): what one wrote before its atomic is
@@ -5998,9 +6150,8 @@ impl<'a> Lower<'a> {
     /// The two host waves of a console wave meet (a group barrier with a shared-memory
     /// fence): LDS writes before are seen by reads after.
     fn lds_meeting(&mut self) {
-        let mode = self.s.m.i32(meeting_mode());
-        let void = self.s.t.void;
-        self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        let c = self.cur;
+        self.meet(c);
     }
 
     /// Whether `v` is a register no program reads as a number: a descriptor dword without
@@ -9436,10 +9587,10 @@ impl<'a> Lower<'a> {
                     self.s.m.store(self.cur, ptr, a);
                     self.end_guarded(at, &[]);
                     let c2 = self.cur;
-                    self.group_sync(c2);
+                    self.meet(c2);
                     let ptr = self.s.m.element(c2, lds, k);
                     let r = self.s.m.load(c2, ptr);
-                    self.group_sync(c2);
+                    self.meet(c2);
                     return int(self, r);
                 }
                 let r = self.read_lane(a, lane);

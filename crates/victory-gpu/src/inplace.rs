@@ -137,6 +137,14 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
+    // Title buffers in place assume every submission is waited for; with
+    // late wait (which `VICTORY_RELAY=2`, play.ps1's default, brings) a
+    // submission still in flight may write what the title then reads: copied.
+    if !window && crate::host::late() {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| tracing::warn!("VICTORY_INPLACE=2 with late wait: title buffers are copied as before, windows outside buffers are still placed"));
+        return None;
+    }
     // View memory: known from the runtime without asking Windows.
     if cover(start as usize, len as usize) != Cover::None {
         STATS[4].fetch_add(1, Ordering::Relaxed);

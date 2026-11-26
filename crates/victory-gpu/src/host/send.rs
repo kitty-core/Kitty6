@@ -118,9 +118,11 @@ unsafe impl Send for Memory {}
 /// What submissions that have run gave back.
 static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
-/// At most this much is kept (of the card's memory, with [`on_card`]).
+/// At most this much is kept (of the card's memory, with [`on_card`]; also
+/// 256 MB on a PC of 32 GB or less with `VICTORY_RESIDENCY=1`, where 512 MB
+/// more of RAM is worth more than a few allocations).
 fn kept() -> u64 {
-    if on_card() { 256 << 20 } else { 768 << 20 }
+    if on_card() || crate::residency::limited_host_ram() { 256 << 20 } else { 768 << 20 }
 }
 
 /// Whether the memory lies in the card's memory, written by the CPU through

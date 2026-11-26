@@ -500,6 +500,29 @@ impl Module {
         self.blocks[block].term = Some(t);
     }
 
+    /// Moves everything `block` holds so far (its phis and body) into a new block, which every
+    /// branch to `block` now goes to, and returns it without a terminator. `block` keeps its
+    /// own terminator and is left empty, so code added to it later comes after whatever the
+    /// caller puts between the two (a loop that waits, say). Not for block 0, the entry.
+    pub fn split_before(&mut self, block: usize) -> usize {
+        assert_ne!(block, 0, "the entry block cannot be split before");
+        let pre = self.new_block();
+        self.blocks[pre].phis = std::mem::take(&mut self.blocks[block].phis);
+        self.blocks[pre].body = std::mem::take(&mut self.blocks[block].body);
+        let to = |t: usize| if t == block { pre } else { t };
+        for (b, blk) in self.blocks.iter_mut().enumerate() {
+            if b == pre {
+                continue;
+            }
+            blk.term = match blk.term {
+                Some(Term::Br(t)) => Some(Term::Br(to(t))),
+                Some(Term::CondBr(c, t, f)) => Some(Term::CondBr(c, to(t), to(f))),
+                other => other,
+            };
+        }
+        pre
+    }
+
     pub fn md_str(&mut self, s: &str) -> Md {
         self.mds.push(MdDef::Str(s.into()));
         Md(self.mds.len() as u32 - 1)
@@ -1063,6 +1086,33 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 1);
         assert_eq!(signed(-3), 7);
         assert_eq!(signed(2), 4);
+    }
+
+    #[test]
+    fn a_block_split_before_keeps_its_end_and_takes_its_branches_in_front() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        // 0 -> 1 (a loop on itself) -> 2; 1 holds a phi and a body
+        let (entry, mid, end) = (m.new_block(), m.new_block(), m.new_block());
+        let one = m.i32(1);
+        let phi = m.phi(mid, i32t);
+        let next = m.bin(mid, Bin::Add, phi, one);
+        let c = m.cmp(mid, pred::EQ, next, one);
+        m.set_phi(phi, vec![(one, entry), (next, mid)]);
+        m.terminate(entry, Term::Br(mid));
+        m.terminate(mid, Term::CondBr(c, mid, end));
+        m.terminate(end, Term::Ret);
+        let pre = m.split_before(mid);
+        // what `mid` held is in `pre`, and every branch to `mid` (its own too) goes there
+        assert_eq!(m.blocks[pre].phis.len(), 1);
+        assert_eq!(m.blocks[pre].body.len(), 2);
+        assert!(m.blocks[pre].term.is_none());
+        assert!(m.blocks[mid].phis.is_empty() && m.blocks[mid].body.is_empty());
+        assert!(matches!(m.blocks[entry].term, Some(Term::Br(t)) if t == pre));
+        assert!(matches!(m.blocks[mid].term, Some(Term::CondBr(_, t, f)) if t == pre && f == end));
+        // code added to `mid` now comes after `pre`
+        let _ = m.bin(mid, Bin::Add, next, one);
+        assert_eq!(m.blocks[mid].body.len(), 1);
     }
 
     /// A structured shader's shape: `stages` if/else diamonds in a row, each

@@ -1347,11 +1347,54 @@ impl<'a> Tracer<'a> {
                     Ok(source) if self.anywhere(&source) => Ok(source),
                     _ => Err(e),
                 },
-                None => Err(e),
+                None => self.past_wide_skip(block, &edge, joins, known).ok_or(e),
             },
         };
         joins.pop();
         source.map(Some)
+    }
+
+    /// The descriptor at a join where the edges that hold none come straight from branches
+    /// that skip the code that builds it, in a program with branches the wave takes together
+    /// ([`Structured::wide`]): the console compiler builds a descriptor inside a per-lane
+    /// branch it skips when no lane is left for it, and uses it after the join
+    /// (`alphaResolve`'s sampler). Without wave-wide branches the lanes' paths show that no
+    /// lane that reads it can have skipped ([`Self::only_edge`]); a branch taken wave-wide
+    /// around it lets lanes that do not read it reach the join. A console wave that skipped
+    /// holds whatever the registers held before, which is no descriptor the program defines;
+    /// the one the other edges agree on is taken for it too. Only for a descriptor that can be
+    /// named anywhere (constants and root data).
+    fn past_wide_skip(
+        &self,
+        block: usize,
+        edge: &dyn Fn(usize) -> Vec<Term>,
+        joins: &mut Vec<usize>,
+        known: &mut Known,
+    ) -> Option<Source> {
+        let lanes = self.lanes?;
+        if lanes.wide.is_empty() {
+            return None;
+        }
+        let mut found: Option<Source> = None;
+        for (j, &q) in self.p.blocks[block].preds.iter().enumerate() {
+            match self.classify(&edge(j), joins, known) {
+                Ok(source) if self.anywhere(&source) => {
+                    if found.as_ref().is_some_and(|f| f != &source) {
+                        return None;
+                    }
+                    found = Some(source);
+                }
+                Ok(_) => return None,
+                Err(_) => {
+                    let skip = matches!(lanes.exits[q], LaneExit::Branch { taken, not_taken, .. }
+                            if (taken == block) != (not_taken == block));
+                    if !skip {
+                        return None;
+                    }
+                }
+            }
+        }
+        found
     }
 
     /// Words that `s_cselect` (or `s_cmov`) picks by one SCC value, traced

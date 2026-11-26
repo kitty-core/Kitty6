@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod probe_report;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
 mod run;
@@ -101,6 +102,17 @@ enum Command {
         /// `VICTORY_VIEW_LIMIT` to what the run's log says of the host.
         #[arg(long)]
         warm: Option<PathBuf>,
+    },
+    /// What a run's probe file says the PC was short of (paging, card
+    /// memory, pipelines, one busy thread, the GPU): runs written with
+    /// `VICTORY_PROBE=<folder>` (diagnostics builds). Give two files to
+    /// compare the second with the first.
+    ProbeReport {
+        files: Vec<PathBuf>,
+        /// A second with at least this many draws a frame is in the world
+        /// (the menus draw a few dozen).
+        #[arg(long, default_value_t = 500.0)]
+        world_draws: f64,
     },
     /// Translate every shader found (as `translate` finds them) into the
     /// shader cache, so that no run has to: a few minutes, once per version
@@ -227,6 +239,7 @@ fn main() -> Result<()> {
             translate::run(paths, validate, pipelines, list, jobs, wave)
         }
         Command::Shaders { paths, jobs, list } => translate::precompile(paths, jobs, list),
+        Command::ProbeReport { files, world_draws } => probe_report::run(files, world_draws),
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
         Command::Run {

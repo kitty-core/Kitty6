@@ -43,6 +43,37 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
+    /// Why it is never made ([`left_out`]).
+    left_out: Option<&'static str>,
+}
+
+/// Whether one of `shaders` is a compute shader whose container names `name`.
+fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
+    shaders.iter().any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+}
+
+/// Why a pipeline is never made, after codec-d/cool_fox: with
+/// `VICTORY_RT_RESOLVE=0` and no BVH builder, the title's ~1,000 ray-tracing
+/// resolve shaders (which shade hits there are none of) and its ray
+/// activation shader are left out of the queue, where on a cold cache they
+/// stand before the pipelines draws wait for. Off by default here: what they
+/// write stays as it was (`VICTORY_AMBIENT` fills the indirect light in).
+fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    static SKIP: OnceLock<bool> = OnceLock::new();
+    let skip = *SKIP.get_or_init(|| {
+        std::env::var_os("VICTORY_RT_RESOLVE").is_some_and(|v| v == "0")
+            && std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
+    });
+    if !skip {
+        return None;
+    }
+    if named(shaders, b"CS_RaytracingResolve") {
+        return Some("a ray-tracing resolve without a BVH");
+    }
+    if named(shaders, b"CS_ScreenProbes_ActivateRays") {
+        return Some("ray activation without a BVH");
+    }
+    None
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -60,6 +91,7 @@ impl Pending {
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
         Pending {
+            left_out: left_out(&shaders),
             screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
             shaders,
             graphics,
@@ -81,6 +113,12 @@ impl Pending {
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+            #[cfg(feature = "diagnostics")]
+            crate::probe::pipeline_made(began.elapsed());
+            #[cfg(feature = "diagnostics")]
+            if made.is_none() {
+                crate::probe::pipeline_refused();
+            }
             made
         });
         let (lock, done) = &DONE;
@@ -160,6 +198,9 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    if p.left_out.is_some() {
+        return None;
+    }
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
@@ -175,6 +216,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
+    if p.left_out.is_some() {
+        return false;
+    }
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
 }
@@ -182,6 +226,9 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
+    if p.left_out.is_some() {
+        return;
+    }
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
@@ -241,6 +288,8 @@ fn wait(p: &Pending, frame: u64) {
     drop(held);
     let waited = started.elapsed().min(left);
     waiting.end();
+    #[cfg(feature = "diagnostics")]
+    crate::probe::pipeline_waited(waited);
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
             ms = waited.as_millis() as u64,

@@ -957,6 +957,8 @@ pub(crate) fn host() -> Option<&'static Host> {
 }
 
 fn create() -> windows::core::Result<Host> {
+    // A newer runtime first, where one is beside us (`crate::agility`).
+    crate::agility::load();
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
@@ -1275,9 +1277,31 @@ mod tests {
 /// ([`HostList::batch_place`]).
 const BATCHES: u32 = 8;
 
+/// Every how many resets a host list's command allocator is made anew
+/// (`VICTORY_ALLOCATOR_RENEW=<n>`; 0 never, as before). By default every
+/// 240th on a PC of 32 GB or less with `VICTORY_RESIDENCY=1`, else never.
+fn allocator_renewal() -> u32 {
+    static N: OnceLock<u32> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_ALLOCATOR_RENEW")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(if crate::residency::limited_host_ram() { 240 } else { 0 })
+    })
+}
+
+/// Allocators made anew so far ([`allocator_renewal`]).
+pub(crate) static RENEWED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The game window's title, before the frame rate.
+const CAPTION: &str = "Kitty6";
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
-    allocator: ID3D12CommandAllocator,
+    /// Replaced now and then instead of reset ([`allocator_renewal`]).
+    allocator: Mutex<ID3D12CommandAllocator>,
+    /// Resets since the allocator was made.
+    resets: std::sync::atomic::AtomicU32,
     /// With barriers held and joined (`rec`).
     pub(crate) list: rec::Rec,
     /// Work for submission time, in recorded order.
@@ -2360,6 +2384,10 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// Copies a movie plane the title's decoder writes with the processor
+    /// (address, bytes of title memory read) into upload memory of the
+    /// list's own ([`HostList::plane_upload`]).
+    Plane((usize, usize), Box<dyn Fn() + Send>),
     /// A title buffer copy that the list does on the card ([`place`]): what
     /// is done on the CPU for it.
     Placed(place::Placed),
@@ -2375,6 +2403,10 @@ struct Deferred {
     uploads: Vec<ID3D12Resource>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
+    /// Upload memory that movie planes are copied into ([`Step::Plane`]),
+    /// each with its bytes: back to the scratch chunks when the list is
+    /// reset.
+    plane_uploads: Vec<(Chunk, u64)>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
@@ -2437,6 +2469,7 @@ impl Deferred {
 
 impl Drop for Deferred {
     fn drop(&mut self) {
+        give_chunks(std::mem::take(&mut self.plane_uploads));
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
     }
@@ -2947,6 +2980,29 @@ fn fill_is_titles(src: usize, len: usize) -> bool {
     !crate::watch::landed_lately(src, len, 600) || mode == 1 && crate::watch::written_since_taken(src, len)
 }
 
+/// Whether a small fill of upload memory (up to `VICTORY_FILL_STALE_BYTES`;
+/// off by default) goes on without waiting for flights whose shaders may write
+/// what it reads, taking those bytes as they were before them.
+///
+/// Found with `tools/kitty6-prof` and the settle lines: in the opening scene
+/// one fill of 0xb0 bytes a frame, always at the same place inside 0x4b0 bytes
+/// a shader writes every frame (a value the card works out and the title
+/// reads back as constants), waited for every flight: ~21 ms a frame, the
+/// card's whole frame, so preparing and the card never overlapped
+/// (19 fps, run O-why). `VICTORY_FILL_TITLE=2` did not help (the page is
+/// landed every frame). What can go wrong: such constants lag a frame or
+/// two behind the card (exposure adapting a frame later). Measured: 4096
+/// moved the wait to the next fill (32 KB, 18 ms, run Q-stale); 1 MB to
+/// "what a copy at its place writes" (12 ms), 19 -> 20 fps (run R-stale1m).
+/// Not worth its risk alone, so off until the other waits go too.
+fn fill_stale(len: usize) -> bool {
+    static MOST: OnceLock<usize> = OnceLock::new();
+    let most = *MOST.get_or_init(|| {
+        std::env::var("VICTORY_FILL_STALE_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    len <= most
+}
+
 /// Diagnostics: the waits for flights, by what waited, why it was not done
 /// on the card ([`card_steps`]), its bytes, and the declared write it lies
 /// in (start, bytes).
@@ -3113,7 +3169,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 &Step::Fill(_, src, len, _) => {
-                    if read_blocked(written, src, len) {
+                    if read_blocked(written, src, len) && !fill_stale(len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "diagnostics")]
@@ -3129,6 +3185,16 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                             LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "diagnostics")]
                             blame("a texture", written, at, len);
+                        }
+                        return Some(WHY_READ);
+                    }
+                }
+                &Step::Plane((at, len), _) => {
+                    if touches(written, at, at.saturating_add(len)) {
+                        if count {
+                            LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            blame("a movie plane", written, at, len);
                         }
                         return Some(WHY_READ);
                     }
@@ -4254,7 +4320,8 @@ impl Host {
                 );
             }
             Ok(HostList {
-                allocator,
+                allocator: Mutex::new(allocator),
+                resets: std::sync::atomic::AtomicU32::new(0),
                 list: rec::Rec::new(list),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
@@ -6558,12 +6625,30 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
+        let mut allocator = self.allocator.lock().unwrap_or_else(|e| e.into_inner());
+        // An allocator keeps the memory of the largest recording it held:
+        // now and then a fresh one is made instead, so one large frame does
+        // not hold that memory for the rest of the run.
+        let renew = allocator_renewal();
+        if renew != 0 && self.resets.fetch_add(1, Ordering::Relaxed) + 1 >= renew {
+            self.resets.store(0, Ordering::Relaxed);
+            // SAFETY: a device child's device; a new allocator of the type.
+            let fresh = unsafe {
+                let mut device: Option<ID3D12Device> = None;
+                allocator
+                    .GetDevice(&mut device)
+                    .ok()
+                    .and(device)
+                    .and_then(|d| d.CreateCommandAllocator::<ID3D12CommandAllocator>(D3D12_COMMAND_LIST_TYPE_DIRECT).ok())
+            };
+            if let Some(fresh) = fresh {
+                *allocator = fresh;
+                RENEWED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         // SAFETY: the list is not executing.
-        let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
-        };
+        let reset = unsafe { allocator.Reset().and_then(|()| self.list.Reset(&*allocator, None)) };
+        drop(allocator);
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
@@ -7492,6 +7577,28 @@ impl HostList {
         self.deferred().copies.push(Step::Texture(staging));
     }
 
+    /// Upload memory of `size` bytes that only this list uses until it is
+    /// reset, and a step at its submission that fills it: `fill` is given
+    /// its address and reads `read` (address, bytes) of title memory. For
+    /// movie planes ([`crate::texture::upload_from`]): each list that
+    /// samples one has its own copy of the plane as it was when that list
+    /// was submitted, so no list's copy is written while another list's
+    /// copy from it may still run on the card.
+    pub(crate) fn plane_upload(
+        &self,
+        size: u64,
+        read: (usize, usize),
+        fill: impl Fn(usize) + Send + 'static,
+    ) -> Option<ID3D12Resource> {
+        let chunk = take_chunk(host()?, size)?;
+        let source = chunk.buffer.clone();
+        let destination = chunk.data;
+        let mut deferred = self.deferred();
+        deferred.plane_uploads.push((chunk, size));
+        deferred.copies.push(Step::Plane(read, Box::new(move || fill(destination))));
+        Some(source)
+    }
+
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges). Copies and fills that
@@ -7620,6 +7727,15 @@ impl HostList {
                             batch.refresh_textures();
                         }
                     }
+                    continue;
+                }
+                // Counted with the texture refreshes, which it stands for.
+                Step::Plane((_, len), fill) => {
+                    let started = std::time::Instant::now();
+                    let _step = crate::timeline::span("a movie plane");
+                    fill();
+                    PREPARING[2].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    PREPARING[3].fetch_add(*len as u64, Ordering::Relaxed);
                     continue;
                 }
             };
@@ -9181,6 +9297,8 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
+        #[cfg(feature = "diagnostics")]
+        crate::probe::frame(hwnd.0 as usize);
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {
@@ -9297,6 +9415,18 @@ impl Meter {
             // Over the same frames as the counts above.
             #[cfg(feature = "diagnostics")]
             let drops = crate::pipeline::take_drops();
+            // The probes' row and the overlay's numbers: every second (the
+            // lines below only every 5 s).
+            #[cfg(feature = "diagnostics")]
+            crate::probe::second(crate::probe::Line {
+                frames,
+                fps,
+                prep_ms: cpu,
+                gpu_ms: gpu,
+                draws,
+                dropped,
+                waiting: crate::pipeline::making(),
+            });
             if !five {
                 return;
             }
@@ -9445,15 +9575,11 @@ impl Meter {
                 }
         });
         if self.caption.is_none() {
-            // The window's own text, read without a message.
-            let mut buffer = vec![0u16; 512];
-            // SAFETY: a window handle and a buffer of that length.
-            let n = unsafe { InternalGetWindowText(hwnd, &mut buffer) };
-            buffer.truncate(n.max(0) as usize);
-            self.caption = Some(buffer);
+            // This build's name in place of the window's own text.
+            self.caption = Some(CAPTION.encode_utf16().collect());
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let text = format!(" | {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -9540,6 +9666,8 @@ impl Host {
             format
         };
         let (width, height) = (desc.Width as u32, desc.Height);
+        #[cfg(feature = "diagnostics")]
+        crate::probe::set_resolution(width, height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
@@ -10411,7 +10539,7 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
-            w!("VIctory"),
+            w!("Kitty6"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,

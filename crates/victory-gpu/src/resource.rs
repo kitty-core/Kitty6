@@ -1276,12 +1276,33 @@ pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -
     if layout.bytes_from(first) < layout.size { first } else { 0 }
 }
 
+/// Levels left out at the top of large textures' host copies, for a PC
+/// whose card and RAM are full: `VICTORY_TEXTURE_MIP_BIAS=<n>` (0 to 3, off
+/// by default) makes the copy of a 2D texture of `VICTORY_TEXTURE_MIP_BIAS_MIN`
+/// (default 1024) texels or more on a side begin `n` levels lower. One level
+/// is about three quarters of such a texture's bytes; up close it looks
+/// softer. Only textures the title fills (not render targets), and only with
+/// held levels on (`VICTORY_LEVELS_ON_DEMAND` unset).
+#[cfg(windows)]
+fn mip_bias(desc: &ResourceDesc) -> u32 {
+    static BIAS: std::sync::OnceLock<(u32, u64)> = std::sync::OnceLock::new();
+    let (bias, min) = *BIAS.get_or_init(|| {
+        let n = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<u64>().ok());
+        (n("VICTORY_TEXTURE_MIP_BIAS").unwrap_or(0).min(3) as u32, n("VICTORY_TEXTURE_MIP_BIAS_MIN").unwrap_or(1024).max(1))
+    });
+    if bias == 0 || desc.width.max(u64::from(desc.height)) < min {
+        return 0;
+    }
+    bias
+}
+
 /// The level a host copy begins at for views that start at `first`: one the
 /// host can have as a texture's level 0 ([`read_from`]; block-compressed
 /// formats in whole blocks).
 #[cfg(windows)]
 fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
     const TEXTURE_2D: u32 = 3;
+    let first = first.saturating_add(mip_bias(desc));
     if first == 0
         || !fills(desc)
         || desc.dimension != TEXTURE_2D
@@ -1369,6 +1390,30 @@ fn stored_levels(r: &Resource, first: u32) -> Option<(u32, std::sync::Arc<Vec<u8
 /// bytes of title memory such copies' textures take whole.
 #[cfg(windows)]
 pub(crate) static HELD: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// The host copy's subresource for the title's subresource `index` of a
+/// texture whose copy may begin at a lower level ([`base_level`]): the same
+/// where it begins at the title's level 0; `None` for a level larger than
+/// the copy holds (a copy there has no place to go and is left out).
+#[cfg(windows)]
+pub(crate) fn host_subresource(this: This, index: u32) -> Option<u32> {
+    if this.is_null() {
+        return Some(index);
+    }
+    let r = resource(this);
+    let base = r.host.made.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |(host, _)| host.base);
+    shift_subresource(index, u32::from(r.desc.mip_levels), base)
+}
+
+/// [`host_subresource`] for a texture of `mips` levels whose copy begins at
+/// `base`.
+fn shift_subresource(index: u32, mips: u32, base: u32) -> Option<u32> {
+    if base == 0 || mips <= 1 {
+        return Some(index);
+    }
+    let (slice, mip) = (index / mips, index % mips);
+    (mip >= base).then(|| slice * (mips - base) + mip - base)
+}
 
 /// A view of the placed texture `this` that starts at level `first` is made
 /// or brought up to date: a host copy without that level is replaced by one
@@ -1621,11 +1666,10 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
-            if first != u32::MAX {
-                base = base_level(&r.desc, first);
-            }
+            base = base_level(&r.desc, if first == u32::MAX { 0 } else { first });
             // The store has its larger levels: made whole at once.
             if base > 0
+                && first != u32::MAX
                 && tiled.is_none()
                 && let Some(found) = stored_levels(r, first)
             {
@@ -3356,6 +3400,16 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn subresources_of_copies_begun_lower() {
+        assert_eq!(shift_subresource(3, 10, 0), Some(3));
+        assert_eq!(shift_subresource(0, 10, 1), None);
+        assert_eq!(shift_subresource(1, 10, 1), Some(0));
+        assert_eq!(shift_subresource(9, 10, 2), Some(7));
+        assert_eq!(shift_subresource(12, 10, 2), Some(8));
+        assert_eq!(shift_subresource(5, 1, 1), Some(5));
+    }
 
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {

@@ -20,6 +20,11 @@ const S_ENDPGM: u32 = 0xBF81_0000;
 /// `skip`: the branch past the body when no thread is below s0: `s_cbranch_execz`, or
 /// `s_cbranch_scc0` on the SCC `s_and_saveexec` sets ("some lane is left").
 fn program(skip: u32) -> NativeProgram {
+    program_of(skip, 64)
+}
+
+/// [`program`] in thread groups of `threads` (whole console waves).
+fn program_of(skip: u32, threads: u32) -> NativeProgram {
     let mut words = vec![
         0x7E0A_0281, // v_mov_b32 v5, 1
         0x2C0C_0081, // v_lshrrev_b32 v6, 1, v0
@@ -35,7 +40,7 @@ fn program(skip: u32) -> NativeProgram {
         0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
         0xBEFE_040C, // s_mov_b64 exec, s[12:13]
     ]);
-    native(&words)
+    native_of(&words, true, threads)
 }
 
 /// A wave64 compute program of 64 threads (one console wave; the thread index in v0) with 4
@@ -1373,4 +1378,64 @@ fn both_host_waves_observe_the_lds_flag_after_the_join() {
         }
     }
     eprintln!("all 14 flag dispatches passed on a 32-lane hardware adapter");
+}
+
+#[test]
+fn the_switch_is_on_by_default_only_without_64_lane_waves() {
+    assert!(lower::wave64_emulate(32, None));
+    assert!(!lower::wave64_emulate(64, None));
+    // (no host known: nothing is assumed of it)
+    assert!(!lower::wave64_emulate(0, None));
+    assert!(!lower::wave64_emulate(32, Some("0")));
+    assert!(lower::wave64_emulate(32, Some("1")));
+    assert!(!lower::wave64_emulate(64, Some("1")));
+}
+
+/// A group of two console waves (128 threads) whose wave OR sits in a per-lane branch, taken
+/// wave-wide: the second console wave's threads (64..127, never below s0 here) do not go in,
+/// so the two host waves of the first must meet without them, on their own counter
+/// ([`lower::with_pair_meetings`]). Lowered for waves of 32, validated, and run on the host
+/// GPU when it takes waves of 32: the OR is the first console wave's, of both its halves.
+#[test]
+fn two_console_waves_in_a_group_meet_in_pairs_inside_a_wave_wide_branch() {
+    let native = program_of(0xBF88_0000, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let branch = (0..p.blocks.len())
+        .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
+        .expect("the branch");
+    let wide = HashSet::from([branch]);
+    let shader = lower::with_pair_meetings(|| lowered(&native, &p, &wide)).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (below, expected) in [(64u32, u32::MAX), (40, 0x000F_FFFF), (33, 0x0001_FFFF), (10, 0x1F), (1, 1)] {
+        let Some(out) = on_the_card(&shader, [below, 0]) else {
+            return;
+        };
+        assert_eq!(out, expected, "{below} threads in the branch");
+    }
+    eprintln!("ran on the hardware device: the pair meetings gave the OR of both halves");
+}
+
+/// Without pair meetings, two console waves per group keep their group barriers, and the
+/// pair counters are not made: only [`lower::with_pair_meetings`] changes the lowering.
+#[test]
+fn pair_meetings_only_change_programs_lowered_with_them() {
+    let native = program_of(0xBF88_0000, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let branch = (0..p.blocks.len())
+        .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
+        .expect("the branch");
+    let wide = HashSet::from([branch]);
+    let plain = lowered(&native, &p, &wide).expect("lower");
+    let paired = lower::with_pair_meetings(|| lowered(&native, &p, &wide)).expect("lower");
+    assert_ne!(plain.dxil, paired.dxil);
+    // (a group of one console wave has no pair counters to make)
+    let one = program_of(0xBF88_0000, 64);
+    let p1 = ir::build(&one.code, one.wave64, one.vgprs).expect("ir::build");
+    let a = lowered(&one, &p1, &wide).expect("lower");
+    let b = lower::with_pair_meetings(|| lowered(&one, &p1, &wide)).expect("lower");
+    assert_eq!(a.dxil, b.dxil);
 }

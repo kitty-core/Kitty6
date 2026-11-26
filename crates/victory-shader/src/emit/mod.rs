@@ -572,7 +572,7 @@ pub fn emit(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why);
+                        let again = widen(c, native, base, why, false);
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
@@ -624,6 +624,25 @@ pub fn emit(
                 }
             }
         }
+        // Last of all, on a host without 64-lane waves (`VICTORY_WAVE64_EMULATE`): the
+        // console wave emulated exactly by its two host waves, with the per-lane branches
+        // around its cross-lane code and shared memory taken wave-wide ([`widen`]), also in
+        // groups of several console waves. Where nothing above translated, so it changes no
+        // program that translated before; without it these have no pipeline on such a host.
+        if lower::wave64_emulate_on() && !wide_on {
+            let bases = [
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            for base in bases.into_iter().flatten() {
+                let again = widen(c, native, base, why, true);
+                report("emulated wave64 (wave-wide branches)", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
+                }
+            }
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
@@ -634,7 +653,7 @@ pub fn emit(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
+            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false);
             match again {
                 Ok(_) => again,
                 Err(_) => emit_program(c, native, p, st, io, res),
@@ -666,11 +685,15 @@ pub fn emit(
 /// it translates or a branch cannot be widened. Only where a thread group is one console
 /// wave: with several, the waves of a group would decide differently and a barrier inside
 /// such a branch would wait for threads that never come.
+/// `pairs` ([`lower::wave64_emulate_on`]): also in a group of several whole console waves,
+/// whose two host waves per console wave then meet on a counter of their own instead of at
+/// group barriers ([`lower::with_pair_meetings`]).
 fn widen(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
     why: bool,
+    pairs: bool,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
@@ -680,6 +703,7 @@ fn widen(
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        crate::native::StageIo::Cs(cs) if pairs && cs.threads.iter().product::<u32>() % 64 == 0 => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
@@ -694,7 +718,12 @@ fn widen(
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();
-        let r = emit_program(c, native, p, &st, &io, &res);
+        let several = matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() > 64);
+        let r = if pairs && several {
+            lower::with_pair_meetings(|| emit_program(c, native, p, &st, &io, &res))
+        } else {
+            emit_program(c, native, p, &st, &io, &res)
+        };
         let needs = lower::take_needs();
         // (or translated for 64-lane waves still: shared memory read and written where not
         // every lane runs, whose blocks the lowering names too)

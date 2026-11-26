@@ -76,3 +76,7 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# Kitty6: local worktrees and standalone tool builds
+/.claude/
+/tools/*/target/
