@@ -9,7 +9,11 @@ other forks find and attacking each problem from more than one side.
 - **The tracker**: https://vuyp.github.io/gta6-pc-race/ (data in
   `vuyp/gta6-pc-race` `src/data.json`). Look at who moved up, and why.
 - **Pull requests and recent commits** on the other forks, open *and* merged:
-  `gh pr list -R <owner/repo> --state all --limit 30`, `gh api repos/<o>/<r>/commits`.
+  `gh pr list -R <owner/repo> --state all --limit 30`, `gh api repos/<o>/<r>/commits`
+  (on this PC: `~/tools/gh/ghk`, gh with git's GitHub login).
+- **PortWatch** (https://portwatch-vi.xyz/data/tracker.json): outside picture
+  scores the tracker relays. On 26 Nov it rated DexNom/VIctory best (real ray
+  tracing on AMD, about 1 fps), then Belobug.
   Start with upstream avatarmanz/VIctory-7900XTX, then Vice-Tay, VI-BR-PORT,
   klbf-lab, VIctory-NVIDIA, VIctory-RDNA, victory-fork, Kelvaroq and AnyXboxX, then
   any new names on the tracker.
@@ -61,4 +65,10 @@ other forks find and attacking each problem from more than one side.
 |---|---|---|---|
 | 2026-11-26 | upstream PR #237, #150 | NVIDIA descriptors, readback tracking | 19.7 to 20.5 fps, merged |
 | 2026-11-26 | VI-BR-PORT, Vice-Tay | wave32 shadows, ray-miss skips, 4 KiB small textures, shader fixes | being ported |
+| 2026-11-26 | DexNom/VIctory | "near-perfect picture" fork: the title's own ray tracing on AMD | about 1 fps, not for this PC; its quad and cube-map fix (921d8d3b) may port |
+| 2026-11-26 | VI-BR-PORT 389b974 | card copies of 1 MiB to 1 GiB buffers | already covered: ours run 64 KiB to 1.5 GiB |
+| 2026-11-26 | VIniVIdiVIci a53b093, Fayberr 00a21ef, Vice-Tay #41, fxceless #1359, trustno1 #7 | page-hash copy skip, idle texture freeing, snapshot pool freeing, readback reuse | being ported (memory batch) |
+| 2026-11-26 | VI-BR-PORT a46bbdc, Fayberr 1bf62e1, vilocity bb0835a/601d5db/899ef0f, upstream #336, fxceless #837 | wave-wide refused shaders, magenta probe drop, shadow-tile barriers (orange), probe inject clear, mouths, LDS bounds, NaN guard | being ported (picture batch) |
+| 2026-11-26 | own | NVIDIA-tuned shader translation: measure the translator's overhead (wave64 exchange, exec masks, packed halves, scalar emulation) and emit for 32-lane NVIDIA waves instead of mirroring RDNA (`VICTORY_NV_*`) | in progress |
+| 2026-11-26 | own (idea) | the title's AMD FSR4 path asks for precompiled AMD pipelines (`DeserializeComputePipelineStateX` fails, falls back each time): see what our layer does there and give NVIDIA a cheaper path | to look at |
 | 2026-11-26 | own | full-frame capture (`VICTORY_RECORD`) for shader costs | title crashes during the long stall; use skip-timing instead |
