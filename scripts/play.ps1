@@ -76,6 +76,10 @@ if ($Lean) {
     $settings.VICTORY_PORT_CBV = '1'; $settings.VICTORY_PORT_GUARD = '1'; $settings.VICTORY_PORT_JOURNAL = '1'
     # No ray-tracing resolve pipelines without the BVH builder (as codec-d/cool_fox)
     if (-not $RayTracing) { $settings.VICTORY_RT_RESOLVE = '0' }
+    # Without rays the title's indirect light is black indoors and leaves blocks of stale probe light:
+    # the stand-in estimates it from the frame (ambient.rs). Closer to the console's picture, at no
+    # measured cost (runs J/K-ambient, 2026-11-26).
+    if (-not $RayTracing) { $settings.VICTORY_AMBIENT = '1' }
     $settings.VICTORY_RESIDENCY = '1'; $settings.VICTORY_LOG = 'warn'
     # No device-removal breadcrumbs: in a diagnostics build they also keep a book of
     # up to 400,000 released resources.
