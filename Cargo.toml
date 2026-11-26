@@ -12,6 +12,7 @@ license = "GPL-3.0-or-later"
 publish = false
 
 [workspace.dependencies]
+mimalloc = { version = "0.1", default-features = false }
 # Internal crates
 victory-core = { path = "crates/victory-core" }
 victory-pe = { path = "crates/victory-pe" }
