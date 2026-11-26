@@ -9438,6 +9438,7 @@ impl Meter {
                 "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
             );
             crate::shadow::exact_line(frames);
+            crate::windowskip::line(frames);
             crate::descriptor::sync_line(frames);
             late_line(frames);
             crate::queue::behind_line(frames);

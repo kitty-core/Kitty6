@@ -96,6 +96,16 @@ pub(crate) struct Shadow {
     changes_only: std::sync::atomic::AtomicBool,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
+    /// A window with no card side: per 4 KiB page of title memory from the
+    /// window's first on, a print of the bytes last copied into its buffer
+    /// (0: none, or only a part of the page) (`crate::windowskip`); empty
+    /// until the window first takes title memory with the switch set.
+    /// Locked around the copy.
+    prints: Mutex<Vec<u64>>,
+    /// Whether shaders were ever said to write the copy
+    /// ([`Shadow::writing`]): a window with no card side then compares
+    /// nothing with what it last copied (its buffer may hold their bytes).
+    written_said: std::sync::atomic::AtomicBool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -2682,6 +2692,10 @@ impl Drop for Shadow {
         if self.mapped {
             WINDOW_MAPPED_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
+        let prints = self.prints.get_mut().unwrap_or_else(|e| e.into_inner()).len();
+        if prints != 0 {
+            crate::windowskip::prints_gone(prints);
+        }
         if let Some(card) = &mut self.card {
             if window {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
@@ -3254,6 +3268,8 @@ impl Shadow {
             window: false,
             changes_only: Default::default(),
             mapped: false,
+            prints: Mutex::default(),
+            written_said: std::sync::atomic::AtomicBool::new(false),
             place: None,
         }
     }
@@ -3299,6 +3315,11 @@ impl Shadow {
     pub(crate) fn writing(&self, address: usize, len: usize) {
         if self.place.is_some() {
             return;
+        }
+        // A window with no card side compares nothing from here on
+        // (`crate::windowskip`).
+        if !self.written_said.load(Ordering::Relaxed) {
+            self.written_said.store(true, Ordering::Relaxed);
         }
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -4396,6 +4417,11 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        let skip = self.window_skip(from, to);
+        if skip == crate::windowskip::SkipSame::Skip {
+            self.copy_window_skipping(from, to);
+            return to - from;
+        }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         if self.card.is_some() && from < to && crate::host::upcheck::on() {
@@ -4411,7 +4437,96 @@ impl Shadow {
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
+        if skip == crate::windowskip::SkipSame::Sample {
+            self.window_sample(from, to);
+        }
         to - from
+    }
+
+    /// What [`Shadow::copy`] of title memory `[from, to)` (inside the
+    /// buffer) does with the pages that hold what it last copied
+    /// (`crate::windowskip::mode`): only a window with no card side (in the
+    /// PC's memory or in mapped card memory, not in place) compares, and
+    /// not one shaders were said to write, whose bytes count as nothing to
+    /// compare with.
+    fn window_skip(&self, from: usize, to: usize) -> crate::windowskip::SkipSame {
+        use crate::windowskip::SkipSame;
+        if !self.window || self.card.is_some() || self.place.is_some() || from >= to {
+            return SkipSame::Off;
+        }
+        let mode = crate::windowskip::mode();
+        if mode != SkipSame::Off && self.written_said.load(Ordering::Relaxed) {
+            crate::windowskip::unknown(to - from);
+            crate::windowskip::taken(to - from, 0);
+            return SkipSame::Off;
+        }
+        mode
+    }
+
+    /// A window's prints (`Shadow::prints`), made at the first ask.
+    fn window_prints(&self) -> std::sync::MutexGuard<'_, Vec<u64>> {
+        let mut prints = self.prints.lock().unwrap_or_else(|e| e.into_inner());
+        if prints.is_empty() {
+            let n = crate::windowskip::prints_for(self.start as usize, (self.start + self.len) as usize);
+            prints.resize(n, 0);
+            crate::windowskip::prints_made(n);
+        }
+        prints
+    }
+
+    /// [`Shadow::copy`] of a window with no card side with
+    /// `VICTORY_WINDOW_SKIP_SAME=1`: title memory `[from, to)` (inside the
+    /// buffer) is read into memory of this thread's, and each run of 4 KiB
+    /// pages whose bytes are not what the window last copied goes into the
+    /// window's buffer (`crate::windowskip::copy`). A page that cannot be
+    /// read is read as zeros, as the copy without the switch stores it. The
+    /// prints stay locked until the bytes are in: a print is always that of
+    /// the bytes the buffer holds for its page.
+    fn copy_window_skipping(&self, from: usize, to: usize) {
+        thread_local! {
+            static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let mut prints = self.window_prints();
+        let mut tally = [0u64; 3];
+        let sent = READ.with(|read| {
+            crate::windowskip::copy(
+                (start, end),
+                (from, to),
+                &mut prints,
+                &mut read.borrow_mut(),
+                &mut tally,
+                |at, into| crate::host::copy_mapped(into.as_mut_ptr(), at as *const u8, into.len(), false),
+                |at, bytes| {
+                    // SAFETY: inside the mapping (`[at, at + len)` lies in
+                    // `[from, to)`, within the buffer); nothing else writes
+                    // a window's buffer while a refresh has it (no shader
+                    // writes one that compares, and a refresh is one
+                    // thread's).
+                    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(at - start), bytes.len()) };
+                    // After the bytes are in: a snapshot taken meanwhile is
+                    // not current.
+                    self.changed(at - start, at - start + bytes.len());
+                },
+            )
+        });
+        drop(prints);
+        crate::windowskip::tally_add(&tally);
+        crate::windowskip::taken(sent, (to - from).saturating_sub(sent));
+    }
+
+    /// `VICTORY_WINDOW_SKIP_SAME=sample`: of title memory `[from, to)` a
+    /// window with no card side has just copied, one 4 KiB page in 16 is
+    /// read again and compared with the window's prints, for the frame line
+    /// (`crate::windowskip::sample`). Nothing is left out.
+    fn window_sample(&self, from: usize, to: usize) {
+        let window = (self.start as usize, (self.start + self.len) as usize);
+        let mut tally = [0u64; 3];
+        crate::windowskip::sample(window, (from, to), &mut self.window_prints(), &mut tally, |at, into| {
+            crate::host::read_into(at as *const u8, into)
+        });
+        crate::windowskip::tally_add(&tally);
+        crate::windowskip::taken(to - from, 0);
     }
 
     /// Whether shaders read and write this copy in the card's own memory
