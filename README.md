@@ -66,12 +66,20 @@ How it got here on this PC, in the order found:
 - Two of the compute shaders the RTX 4070 refused (they kept a 64-lane wave size)
   now run in waves of 32 (`VICTORY_LDS_REGIONS`, on).
 
-Known problems: purple noisy patches and orange glow on some clothing, grey-blue
-arms (the blocky light tiles and black interiors are gone with the indirect-light
-stand-in, `VICTORY_AMBIENT=1`, on in `-Lean`); four compute shaders still refused on NVIDIA; mouths only
-just got the upstream fix (PR #114) and are not checked yet. The frame is bound by
-CPU and GPU memory coherence: about 25 MB up and 35-47 MB fetched back per frame,
-and the submitting thread waits for the card about a third of the frame.
+### Known problems
+
+| | |
+|---|---|
+| <img src="docs/media/bug-blocky-tiles-on-head.jpg" width="260" alt="Blocky black squares over a character's head and back"> | **Blocky black tiles** on heads, hair and backs in some shots. |
+| <img src="docs/media/bug-purple-patches-grey-arms.jpg" width="260" alt="A purple patch on a wall and a grey arm"> | **Purple patches** indoors (a fix is on `dev`, not yet checked in the game) and **grey-blue arms**. |
+
+Also: four compute shaders are still refused on NVIDIA (64-lane waves). Mouths
+have the 16-bit fix and are not checked yet. The frame is bound by CPU and GPU
+memory coherence: about 25 MB up and 35-47 MB fetched back per frame, and the
+submitting thread waits for the card about a third of the frame.
+
+**Follow the work:** [`docs/LOG.md` on the `dev` branch](https://github.com/kitty-core/Kitty6/blob/dev/docs/LOG.md)
+is updated often. `main` only takes tested changes.
 
 ## How to run it
 
