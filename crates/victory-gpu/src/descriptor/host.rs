@@ -1539,6 +1539,7 @@ impl Taken {
     }
 
     /// Whether slot `at` is taken; `None` past the end.
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     fn get(&self, at: usize) -> Option<bool> {
         (at < self.len).then(|| self.words[at / 64] >> (at % 64) & 1 != 0)
     }
