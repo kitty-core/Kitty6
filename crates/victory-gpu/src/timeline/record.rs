@@ -443,6 +443,25 @@ struct Asked {
     after: Vec<f64>,
     frames: u64,
     started: std::time::Instant,
+    /// `key,<frames>,<file>`: a recording each time F8 is pressed (our
+    /// window in front), as many as asked, instead of at set times.
+    on_key: bool,
+}
+
+/// F8 was pressed since the last call, with one of our windows in front.
+fn f8_pressed() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F8};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    static DOWN: AtomicBool = AtomicBool::new(false);
+    // SAFETY: a plain query.
+    let down = unsafe { GetAsyncKeyState(i32::from(VK_F8)) } < 0;
+    if DOWN.swap(down, Ordering::Relaxed) || !down {
+        return false;
+    }
+    let mut process = 0;
+    // SAFETY: plain queries; room for the answer.
+    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut process) };
+    process == std::process::id()
 }
 
 /// `<from s>[+<from s>..],<frames>,<file>`, or a file alone.
@@ -467,7 +486,9 @@ fn asked() -> Option<&'static Asked> {
             let file = std::env::var_os("VICTORY_TIMELINE").filter(|v| !v.is_empty())?;
             let number = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<f64>().ok());
             let text = file.to_string_lossy();
-            let (when, file) = parse(&text);
+            let on_key = text.starts_with("key,");
+            let keyed = text.replacen("key,", "0,", 1);
+            let (when, file) = parse(if on_key { &keyed } else { &text });
             let (after, frames) = when.unwrap_or_else(|| {
                 (
                     vec![number("VICTORY_TIMELINE_AT").unwrap_or(60.0)],
@@ -479,6 +500,7 @@ fn asked() -> Option<&'static Asked> {
                 after,
                 frames: frames.clamp(1, 60),
                 started: std::time::Instant::now(),
+                on_key,
             })
         })
         .as_ref()
@@ -514,12 +536,25 @@ pub(crate) fn presented() {
         before: None,
     });
     let mut stage = STAGE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(&after) = asked.after.get(stage.made) else {
-        return;
+    let after = if asked.on_key {
+        // Pressed while one is under way or being written: not counted.
+        let pressed = f8_pressed();
+        if stage.writing || (!stage.ready && !pressed) {
+            return;
+        }
+        if pressed && !stage.ready {
+            tracing::warn!(frames = asked.frames, "F8: a timeline is recorded (VICTORY_TIMELINE=key,..)");
+        }
+        stage.made as f64
+    } else {
+        let Some(&after) = asked.after.get(stage.made) else {
+            return;
+        };
+        if stage.writing || asked.started.elapsed().as_secs_f64() < after {
+            return;
+        }
+        after
     };
-    if stage.writing || asked.started.elapsed().as_secs_f64() < after {
-        return;
-    }
     if !stage.ready {
         // The buffers, the card's lists and the threads' clocks take a
         // while: the recording begins two frames later.
@@ -548,6 +583,10 @@ pub(crate) fn presented() {
     let before = stage.before.take().unwrap_or_default();
     // Several recordings: a file each.
     let file = match asked.after.len() {
+        _ if asked.on_key => {
+            let end = asked.file.extension().map_or("json".into(), |e| e.to_string_lossy().into_owned());
+            asked.file.with_extension(format!("f8-{after:.0}.{end}"))
+        }
         1 => asked.file.clone(),
         _ => {
             let end = asked.file.extension().map_or("json".into(), |e| e.to_string_lossy().into_owned());
@@ -564,6 +603,7 @@ pub(crate) fn presented() {
         crate::host::timeline_restart();
         let mut stage = STAGE.lock().unwrap_or_else(|e| e.into_inner());
         (stage.began, stage.frames, stage.writing) = (false, 0, false);
+        stage.ready = !asked.on_key && stage.ready;
         stage.made += 1;
     };
     if std::thread::Builder::new().name("victory-timeline".into()).spawn(write).is_err() {

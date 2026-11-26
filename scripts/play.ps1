@@ -11,6 +11,15 @@
 #               (docs/probes.md; read it back with target\diag\victory.exe probe-report <file>)
 # -Overlay      the Kitty6 Overlay over the game (target\<build>\kitty6-overlay.exe; F6 hides/shows it,
 #               Ctrl+Alt+F6 quits; a diagnostics build feeds it; docs/probes.md)
+# -Fps          uncapped frame rate: the title's 30 fps cap lifted to this many a second (60, 120;
+#               0 = no cap at all). Off by default: 30 is the game as made (VICTORY_FRAME_INTERVAL_MS)
+# -Quality      Low, Medium or High: texture detail (the top level of large textures left out at
+#               Low and Medium, a second one too at Low; Medium is what -Lean sets)
+# -Drive        scripted gameplay from -DriveAt seconds (default 200): walks, turns, runs and jumps for
+#               about a minute without your hands (diagnostics build), so measurements see moving play
+# -Panel        the run's numbers drawn on the picture (F3 hides and shows them), so screenshots carry them
+# -F8Timeline   F8 in the game records a 3-frame timeline (diagnostics build) to logs\f8.f8-<n>.json/.txt:
+#               where the frame's time went, at the moment you press it
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
@@ -19,6 +28,12 @@ param(
     [switch]$Probe,
     [switch]$Overlay,
     [switch]$Lean,
+    [double]$Fps = -1,
+    [ValidateSet('', 'Low', 'Medium', 'High')][string]$Quality = '',
+    [switch]$Drive,
+    [double]$DriveAt = 200,
+    [switch]$Panel,
+    [switch]$F8Timeline,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{}
 )
@@ -60,7 +75,23 @@ if ($Probe) {
     $settings.VICTORY_PROBE = Join-Path $env:LOCALAPPDATA 'victory\probes'
     if ($settings.VICTORY_LOG -eq 'warn') { $settings.VICTORY_LOG = 'warn,victory_gpu::probe=info' }
 }
+if ($Quality) { $settings.VICTORY_TEXTURE_MIP_BIAS = @{ Low = '2'; Medium = '1'; High = '0' }[$Quality] }
+if ($Fps -eq 0) { $settings.VICTORY_FRAME_INTERVAL_MS = '0' }
+elseif ($Fps -gt 0) { $settings.VICTORY_FRAME_INTERVAL_MS = (1000.0 / $Fps).ToString('0.###', [Globalization.CultureInfo]::InvariantCulture) }
+if ($Panel) { $settings.VICTORY_PANEL = '1' }
+if ($F8Timeline) { $settings.VICTORY_TIMELINE = 'key,3,' + (Join-Path $env:LOCALAPPDATA 'victory\logs\f8.json') }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
+if ($Drive) {
+    # Forward, a turn each way, a run (Shift) and a jump (Space), over and over: seconds after input starts.
+    $t = $DriveAt; $keys = @()
+    for ($i = 0; $i -lt 4; $i++) {
+        $keys += "$($t)-$($t + 6):W", "$($t + 6)-$($t + 7.5):A", "$($t + 7.5)-$($t + 13):W", "$($t + 7.5)-$($t + 13):Shift",
+                 "$($t + 13)-$($t + 14.5):D", "$($t + 14.5):Space", "$($t + 14.5)-$($t + 15.5):W"
+        $t += 16
+    }
+    $settings.VICTORY_KEYS = (@($settings.VICTORY_KEYS) + $keys | Where-Object { $_ }) -join ','
+}
+
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
 if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; exit 1 }

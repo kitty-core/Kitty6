@@ -12,6 +12,8 @@ use std::sync::Mutex;
 #[derive(Default)]
 struct Moved {
     bytes: [u64; 2],
+    /// Of the fetched bytes, those that changed title memory when merged.
+    merged: u64,
     pieces: [HashSet<u32>; 2],
 }
 
@@ -34,6 +36,12 @@ pub(super) fn moved(way: usize, span: (u64, u64), ranges: impl Iterator<Item = (
         }
         last = end;
     }
+}
+
+/// Of the fetched bytes of the copy of `span`, `bytes` changed title memory.
+pub(crate) fn merged(span: (u64, u64), bytes: u64) {
+    let mut all = MOVED.lock().unwrap_or_else(|e| e.into_inner());
+    all.get_or_insert_with(Default::default).entry(span).or_default().merged += bytes;
 }
 
 /// For the log, over `frames` frames.
@@ -63,11 +71,12 @@ pub(super) fn line(frames: f64) {
     for ((start, len), m) in all.into_iter().take(8) {
         let both = m.pieces[0].intersection(&m.pieces[1]).count();
         tracing::info!(
-            "  {start:#x}+{len:#x}: {:.2} MB up in {} different pieces, {:.2} MB fetched in {}, {both} of them both ways",
+            "  {start:#x}+{len:#x}: {:.2} MB up in {} different pieces, {:.2} MB fetched in {} ({:.3} MB of it changed title memory), {both} of them both ways",
             mb(m.bytes[0]),
             m.pieces[0].len(),
             mb(m.bytes[1]),
-            m.pieces[1].len()
+            m.pieces[1].len(),
+            mb(m.merged)
         );
     }
 }

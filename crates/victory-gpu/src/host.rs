@@ -2980,6 +2980,17 @@ fn fill_is_titles(src: usize, len: usize) -> bool {
     !crate::watch::landed_lately(src, len, 600) || mode == 1 && crate::watch::written_since_taken(src, len)
 }
 
+/// Whether steps that read on the CPU what a copy at its place writes go on
+/// without waiting for the flights that write its source
+/// (`VICTORY_PLACED_STALE=1`; off): they read it as it was before them, a
+/// frame or two behind the card. Experimental, to measure how far preparing
+/// and the card overlap once no settle is left (with
+/// `VICTORY_FILL_STALE_BYTES`).
+fn placed_stale() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_STALE").is_some_and(|v| v == "1"))
+}
+
 /// Whether a small fill of upload memory (up to `VICTORY_FILL_STALE_BYTES`;
 /// off by default) goes on without waiting for flights whose shaders may write
 /// what it reads, taking those bytes as they were before them.
@@ -3216,7 +3227,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
             }
         }
     }
-    if placed && place::read_by(runs, written) {
+    if placed && !placed_stale() && place::read_by(runs, written) {
         #[cfg(feature = "diagnostics")]
         if count {
             blame("what a copy at its place writes", &[], 0, 0);
@@ -3920,7 +3931,7 @@ pub(crate) use send::{goes_as_words, words_under};
 pub(crate) mod spans;
 mod torn;
 #[cfg(feature = "diagnostics")]
-mod traffic;
+pub(crate) mod traffic;
 pub(crate) mod upcheck;
 #[cfg(feature = "diagnostics")]
 mod stamps;

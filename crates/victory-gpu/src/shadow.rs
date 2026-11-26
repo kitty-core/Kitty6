@@ -363,6 +363,49 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     Some(buffer)
 }
 
+/// Diagnostics: `VICTORY_TRACE_DIRTY_LEN=<len>` (hex with 0x): the call
+/// stacks that mark bytes of copies of that length to go up to the card, a
+/// few of them spread over the run, in the log (to find who writes a copy
+/// both ways every frame).
+#[cfg(feature = "diagnostics")]
+fn trace_dirty(len: u64) {
+    static LEN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let want = *LEN.get_or_init(|| {
+        std::env::var("VICTORY_TRACE_DIRTY_LEN")
+            .ok()
+            .and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0)
+    });
+    if want == 0 || len != want {
+        return;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n % 997 == 5 && n < 997 * 40 {
+        let trace = std::backtrace::Backtrace::force_capture().to_string();
+        let frames: Vec<&str> = trace.lines().filter(|l| l.trim_start().chars().next().is_some_and(|c| c.is_ascii_digit())).map(str::trim).take(16).collect();
+        tracing::warn!("copy of {len:#x} bytes marked to go up (call {n}): {}", frames.join(" <- "));
+    }
+}
+
+/// Whether a refresh of a copy in the card's memory whose title memory the
+/// write watch does not cover compares it with the CPU's side and sends up
+/// only the dwords that changed, instead of taking and sending it whole
+/// (`VICTORY_UNWATCHED_CHANGED=0`: whole, as before).
+///
+/// Found with `tools/kitty6-prof` and `VICTORY_TRACE_DIRTY_LEN`: one buffer
+/// of 0x1412200 bytes outside the watched memory went 21 MB up and 21 MB back
+/// every frame. Shaders write all of it each frame; their bytes come back
+/// into title memory and the CPU's side alike, and with nothing to say what
+/// changed since, every refresh took the whole 21 MB again
+/// (`update_free` -> `copy`) and sent it up over what the card held.
+/// [`send_changed`] says what the comparison rests on, and why it is not on
+/// for every copy.
+fn unwatched_changed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UNWATCHED_CHANGED").is_none_or(|v| v != "0"))
+}
+
 /// Whether every title buffer's copy has two sides, however small
 /// (`VICTORY_CARD_ALL=1`; off by default).
 ///
@@ -4048,7 +4091,11 @@ impl Shadow {
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        self.copy(from, to);
+        if self.card.is_some() && unwatched_changed() && !crate::host::upcheck::on() {
+            self.take_compared(from, to, true, true);
+        } else {
+            self.copy(from, to);
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
@@ -4292,11 +4339,17 @@ impl Shadow {
     /// Copies title memory `[from, to)` (inside the buffer) into the copy;
     /// `known`: the copy held it before ([`send_changed`]).
     fn take(&self, from: usize, to: usize, known: bool) -> usize {
+        self.take_compared(from, to, known, false)
+    }
+
+    /// [`Shadow::take`]; `compare`: the dwords that changed alone go up
+    /// whatever [`send_changed`] says ([`unwatched_changed`]).
+    fn take_compared(&self, from: usize, to: usize, known: bool, compare: bool) -> usize {
         thread_local! {
             /// A page of title memory, as read.
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
-        let Some(card) = self.card.as_ref().filter(|_| self.changes_only.load(Ordering::Relaxed) || send_changed()) else {
+        let Some(card) = self.card.as_ref().filter(|_| compare || self.changes_only.load(Ordering::Relaxed) || send_changed()) else {
             if known && self.card.is_some() && self.landing.load(Ordering::Acquire) && land_echo() && !crate::host::upcheck::on() {
                 return self.take_landed(from, to);
             }
@@ -4394,6 +4447,8 @@ impl Shadow {
         if runs.peek().is_none() {
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        trace_dirty(self.len);
         let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
         dirty.reserve(most);
         for (from, to) in runs {
@@ -4781,6 +4836,8 @@ impl Shadow {
             }
             put += merged;
         }
+        #[cfg(feature = "diagnostics")]
+        crate::host::traffic::merged(self.span(), put);
         put
     }
 

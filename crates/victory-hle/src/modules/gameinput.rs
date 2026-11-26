@@ -1249,7 +1249,8 @@ mod host {
     /// 0.2 s that long after input starts (`<from>-<to>:<key>`: all that
     /// time), with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// `Left`, `Right`, `Space`, `Shift`, `Ctrl` (the left ones) (the
+    /// stand-in pad's table maps them to buttons).
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
@@ -1265,6 +1266,9 @@ mod host {
                     "Down" => 0x28,
                     "Left" => 0x25,
                     "Right" => 0x27,
+                    "Space" => 0x20,
+                    "Shift" => 0xA0,
+                    "Ctrl" => 0xA2,
                     k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
                         k.as_bytes()[0].to_ascii_uppercase()
                     }
