@@ -5598,7 +5598,44 @@ fn root_window(address: u64, end: u64) -> (u64, u64) {
     if most <= len {
         return (cell, len);
     }
-    root_extent(cell, len, committed_reach(cell + len, cell + most), most)
+    root_extent(cell, len, recent_reach(cell + len, cell + most), most)
+}
+
+/// How long a [`committed_reach`] answer is used again, in milliseconds
+/// (`VICTORY_ROOT_REACH_MS`, 1000; 0: asked every time).
+///
+/// Every ask without a length asked Windows anew, from the threads that
+/// translate list calls, while the title maps and unmaps its pages: 680
+/// queries in 8 frames of driving took 362 ms of those threads (65 us to
+/// 5.7 ms each; 330,000 regions in the address space). What the title
+/// commits around a root view changes far less often than it is asked.
+fn root_reach_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| std::env::var("VICTORY_ROOT_REACH_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1000))
+}
+
+/// [`committed_reach`], answered from what was found for the same range in
+/// the last [`root_reach_ms`].
+fn recent_reach(from: u64, limit: u64) -> u64 {
+    type Found = std::collections::HashMap<(u64, u64), (u64, std::time::Instant)>;
+    static FOUND: std::sync::LazyLock<std::sync::RwLock<Found>> = std::sync::LazyLock::new(Default::default);
+    let ms = root_reach_ms();
+    if ms == 0 {
+        return committed_reach(from, limit);
+    }
+    let fresh = std::time::Duration::from_millis(ms);
+    if let Some(&(reach, at)) = FOUND.read().unwrap_or_else(|e| e.into_inner()).get(&(from, limit))
+        && at.elapsed() < fresh
+    {
+        return reach;
+    }
+    let reach = committed_reach(from, limit);
+    let mut found = FOUND.write().unwrap_or_else(|e| e.into_inner());
+    if found.len() >= 4096 {
+        found.retain(|_, (_, at)| at.elapsed() < fresh);
+    }
+    found.insert((from, limit), (reach, std::time::Instant::now()));
+    reach
 }
 
 /// The window from `cell` of at least `len` bytes that reaches `reach`,
