@@ -301,6 +301,41 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
         .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
 }
 
+/// Whether a compute container is one of the title's `bvh_skinning`
+/// programs: they pose every animated mesh (and its motion) once more, only
+/// for the ray-tracing structures. With every ray a miss
+/// (`VICTORY_RT_MISS=1`) and the structure builder off, nothing reads what
+/// they write, and they were the largest share of the card's time in a
+/// cutscene (~6 ms a dispatch, hundreds a frame).
+#[cfg(windows)]
+fn skins_for_rays(bytes: &[u8]) -> bool {
+    const NAME: &[u8] = b"bvh_skinningCS";
+    bytes.windows(NAME.len()).any(|w| w == NAME)
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn ray_skinning_programs_are_known_by_name() {
+    assert!(skins_for_rays(b"..\0bvh_skinningCSComputeSkinningRigidVelocity_1c34db0a_Wrapped\0.."));
+    assert!(!skins_for_rays(b"PS_PedSkin_0001"));
+}
+
+/// Whether a dispatch of `this` is left out because it only feeds the
+/// ray-tracing structures, which nothing walks: every ray is a miss
+/// (`VICTORY_RT_MISS=1`) and the builder is off. `VICTORY_RT_SKIN=1` runs
+/// them anyway.
+#[cfg(windows)]
+pub(crate) fn skips_rt_skin(this: This) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    !this.is_null()
+        && pipeline(this).rt_skin
+        && *ON.get_or_init(|| {
+            victory_shader::emit::rt_miss()
+                && std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
+                && std::env::var_os("VICTORY_RT_SKIN").is_none_or(|v| v != "1")
+        })
+}
+
 /// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store
 /// stays in the host's copies and is not copied back into title memory. A
 /// check for a first run of the whole builder: a stage that stores where
@@ -432,6 +467,10 @@ struct Pipeline {
     /// The Kitty6 mod rule that applies to it ([`crate::kitty6`]).
     #[cfg(windows)]
     kitty6: Option<u16>,
+    /// One of the title's skinning passes for the ray-tracing structures
+    /// ([`skins_for_rays`]).
+    #[cfg(windows)]
+    rt_skin: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -607,6 +646,7 @@ fn hand_out(
         builder,
         #[cfg(windows)]
         kitty6: crate::kitty6::rule_for(shaders.iter().map(|s| s.hash.as_str())),
+        rt_skin: shaders.iter().any(|s| s.stage == "compute" && skins_for_rays(&s.container)),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
