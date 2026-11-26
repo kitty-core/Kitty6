@@ -25,6 +25,31 @@ is a played session yet, and nobody else has reproduced them.
 | Series X profile at 1080p output (`-Console X -Output 1920x1080`), scripted | 18 to 22 fps |
 | Session length without a crash | runs of about 5 minutes so far (no long session yet) |
 
+### In charts
+
+Drawn from the run probes (`docs/probes.md`) by `tools/charts/charts.py`;
+each run's figure is its median over its last 45 s, in the world.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/charts/progress-dark.svg">
+  <img alt="Median frame rate of 30 scripted runs on 26 November 2026: about 4 fps at the start, 16 with buffer copies on the card, back to about 4 after a merge brought back a lock, then 19 to 20 after the lock fix and the NVIDIA merges; 15 on the Series X profile." src="docs/charts/progress-light.svg" width="100%">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/charts/run-dark.svg">
+  <img alt="Frame rate of one run second by second: 30 in the menus, dips while loading, then about 20 in the opening scene." src="docs/charts/run-light.svg" width="100%">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/charts/memory-dark.svg">
+  <img alt="Memory in the same run: about 19 GB of RAM and 7.4 GB of card memory in use in the world, of 32 GB and 12 GB." src="docs/charts/memory-light.svg" width="100%">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/charts/tracker-dark.svg">
+  <img alt="Frame rates as the GTA VI PC Race tracker listed them on 26 November 2026: VIctory-7900XTX 22, Vice-Tay 21.6, VIctory-NVIDIA 21, Kitty6 20.5, klbf-lab 14, VIctory-RDNA 12.1, VI-BR-PORT 12, Kelvaroq 10. Different PCs, scenes and methods." src="docs/charts/tracker-light.svg" width="100%">
+</picture>
+
 How it got here on this PC, in the order found:
 
 - **4 fps to 15-20 fps**: buffer and window copies in the card's unused memory
@@ -41,8 +66,9 @@ How it got here on this PC, in the order found:
 - Two of the compute shaders the RTX 4070 refused (they kept a 64-lane wave size)
   now run in waves of 32 (`VICTORY_LDS_REGIONS`, on).
 
-Known problems: blocky, stair-stepped light and shadow tiles on some walls; purple
-glow patches indoors; four compute shaders still refused on NVIDIA; mouths only
+Known problems: purple noisy patches and orange glow on some clothing, grey-blue
+arms (the blocky light tiles and black interiors are gone with the indirect-light
+stand-in, `VICTORY_AMBIENT=1`, on in `-Lean`); four compute shaders still refused on NVIDIA; mouths only
 just got the upstream fix (PR #114) and are not checked yet. The frame is bound by
 CPU and GPU memory coherence: about 25 MB up and 35-47 MB fetched back per frame,
 and the submitting thread waits for the card about a third of the frame.
@@ -86,6 +112,14 @@ More on running, the commands and every switch: [docs/README-7900XTX.md](docs/RE
   names from the PDB: per thread what it runs or waits in, call chains, and
   `--focus` for what runs under one function.
 - `apps/kitty6-overlay`: live graphs of the run in a window beside the game.
+- **Renderer mods** (`mods/*.k6mod`, `crates/victory-gpu/src/kitty6.rs`): rule files
+  of our own that skip a translated shader's draws or run them every n-th frame,
+  named by the hash the runtime gives the shader. No title code or data is in them.
+  `scripts\play.ps1` passes them unless `-NoMods`.
+- **Dev menu** (F4 in game, `-Dev` for a script of it): numbers panel, gameplay
+  footage to PNG, frame shots, timelines, autopilot (walk, run, wander), marks, mods
+  off/on for A/B timing in one run.
+- `tools/charts`: the charts above, from the run probes.
 - The in-picture panel (`-Panel`), F8 timelines (`-F8Timeline`), scripted input
   (`-Drive`, `VICTORY_KEYS`) and per-buffer traffic reports in the log.
 
