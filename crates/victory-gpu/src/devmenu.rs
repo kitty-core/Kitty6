@@ -24,7 +24,8 @@
 //! - **snapshot**: the panel's numbers written to the log (warn), with the
 //!   seconds since the first frame: to line them up with footage.
 //! - **autopilot**: keys held for the title: off, walk (W), run (W and Shift),
-//!   circle (W, with A held one second in four).
+//!   wander (a 10-second round of forward, strafes each way, a sprint, a step
+//!   back and a jump, so that a wall does not hold it for long).
 //! - **mark**: a numbered line in the log, and a marked file in the footage.
 
 use std::path::PathBuf;
@@ -70,7 +71,7 @@ impl Item {
 /// Saved frames a second, by [`RATE`].
 const RATES: [f64; 3] = [1.0, 2.0, 5.0];
 /// What the autopilot holds, by [`AUTOPILOT`].
-const PILOTS: [&str; 4] = ["OFF", "WALK", "RUN", "CIRCLE"];
+const PILOTS: [&str; 4] = ["OFF", "WALK", "RUN", "WANDER"];
 
 static OPEN: AtomicBool = AtomicBool::new(false);
 static AT: AtomicUsize = AtomicUsize::new(0);
@@ -114,14 +115,31 @@ pub fn kept_from_title(vk: u8) -> bool {
 /// Keys the autopilot holds now (virtual-key codes).
 pub fn held_keys() -> Vec<u8> {
     const W: u8 = b'W';
-    const A: u8 = b'A';
     const SHIFT: u8 = 0xA0;
     match AUTOPILOT.load(Ordering::Relaxed) {
         1 => vec![W],
         2 => vec![W, SHIFT],
-        3 if (seconds() as u64) % 4 == 0 => vec![W, A],
-        3 => vec![W],
+        3 => wander(seconds() % 10.0),
         _ => Vec::new(),
+    }
+}
+
+/// The wander round's keys `t` seconds into it (0..10).
+fn wander(t: f64) -> Vec<u8> {
+    const W: u8 = b'W';
+    const A: u8 = b'A';
+    const D: u8 = b'D';
+    const S: u8 = b'S';
+    const SHIFT: u8 = 0xA0;
+    const SPACE: u8 = 0x20;
+    match t {
+        t if t < 3.0 => vec![W],
+        t if t < 4.5 => vec![W, D],
+        t if t < 7.0 => vec![W, SHIFT],
+        t if t < 8.5 => vec![W, A],
+        t if t < 9.2 => vec![S],
+        t if t < 9.5 => vec![W, SPACE],
+        _ => vec![W],
     }
 }
 
@@ -411,6 +429,15 @@ mod tests {
             assert!(line.len() <= 40, "{line}");
             assert!(line.bytes().all(|c| c.is_ascii_digit() || c.is_ascii_uppercase() || b" ./-:>".contains(&c)), "{line}");
         }
+    }
+
+    #[test]
+    fn wandering_turns_both_ways_and_backs_off() {
+        let keys: Vec<Vec<u8>> = (0..100).map(|i| wander(f64::from(i) / 10.0)).collect();
+        for key in [b'W', b'A', b'D', b'S', 0xA0, 0x20] {
+            assert!(keys.iter().any(|k| k.contains(&key)), "{key:#x}");
+        }
+        assert!(keys.iter().all(|k| !(k.contains(&b'A') && k.contains(&b'D'))));
     }
 
     #[test]
