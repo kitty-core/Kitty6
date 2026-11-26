@@ -80,3 +80,10 @@ Thumbs.db
 # Kitty6: local worktrees and standalone tool builds
 /.claude/
 /tools/*/target/
+
+# Kitty6: local working notes and per-agent build folders, never pushed
+/CLAUDE.md
+/AGENTS.md
+/docs/scouting.md
+/target-*/
+*.log
