@@ -2704,3 +2704,47 @@ fn a_format_load_read_as_halves_loads_the_integer() {
     }
     assert!(ran > 0, "no SM 6.6 device available");
 }
+
+/// `v_fmac_f32` in the VOP3 encoding takes `neg[2]` (`-acc`) and `abs[2]` (`|acc|`) on its
+/// accumulator, the destination register (upstream #3158). The rows are measured on RDNA2
+/// (gfx1031, IEEE mode off, f32 denormals flushed) as published by the AnyPS5 project
+/// (`VFmacF32AccumulatorModifiers.cpp`, 85129d854d); a NaN is compared as any NaN, as hosts
+/// give NaNs bits of their own.
+#[test]
+fn v_fmac_f32_takes_the_accumulator_modifiers() {
+    // ([a, b, acc], with neg[2], with abs[2])
+    const ROWS: [([u32; 3], u32, u32); 16] = [
+        ([0x3F80_0000, 0x4000_0000, 0x3F80_0000], 0x3F80_0000, 0x4040_0000),
+        ([0x3F80_0000, 0x4000_0000, 0xBF80_0000], 0x4040_0000, 0x4040_0000),
+        ([0x4000_0000, 0x4040_0000, 0xC0C0_0000], 0x4140_0000, 0x4140_0000),
+        ([0x4000_0000, 0xC040_0000, 0xC0C0_0000], 0x0000_0000, 0x0000_0000),
+        ([0x0000_0000, 0xBF80_0000, 0x0000_0000], 0x8000_0000, 0x0000_0000),
+        ([0x0000_0000, 0xBF80_0000, 0x8000_0000], 0x0000_0000, 0x0000_0000),
+        ([0x3F80_0000, 0x3F80_0000, 0x7F80_0000], 0xFF80_0000, 0x7F80_0000),
+        ([0x3F80_0000, 0x3F80_0000, 0xFF80_0000], 0x7F80_0000, 0x7F80_0000),
+        ([0x7F80_0000, 0x3F80_0000, 0xFF80_0000], 0x7F80_0000, 0x7F80_0000),
+        ([0x3F80_0000, 0x3F80_0000, 0x7FC0_0001], 0xFFC0_0001, 0x7FC0_0001),
+        ([0x3F80_0000, 0x3F80_0000, 0xFFA0_0000], 0x7FA0_0000, 0x7FA0_0000),
+        ([0x3F80_0000, 0x3F80_0000, 0x0000_0001], 0x3F80_0000, 0x3F80_0000),
+        ([0x0080_0000, 0x3F80_0000, 0x8080_0001], 0x0100_0000, 0x0100_0000),
+        ([0x4040_0000, 0x3EAA_AAAB, 0xBF80_0000], 0x4000_0000, 0x4000_0000),
+        ([0x7F7F_FFFF, 0x4000_0000, 0xFF7F_FFFF], 0x7F80_0000, 0x7F80_0000),
+        ([0xBF80_0000, 0x4000_0000, 0x4000_0000], 0xC080_0000, 0x0000_0000),
+    ];
+    let nan = |x: u32| x & 0x7FFF_FFFF > 0x7F80_0000;
+    let cases: Vec<[u32; 4]> = ROWS.iter().map(|&([a, b, acc], _, _)| [a, b, acc, 0]).collect();
+    for (label, abs, neg) in [("neg[2]", 0, 4), ("abs[2]", 4, 0)] {
+        // v_mov_b32 v5, v3; v_fmac_f32 v5, v1, v2 (VOP3, the modifier on src2); v_mov_b32 v0, v5
+        let mut body = vec![vop1(0x001, 5, vgpr(3))];
+        body.extend(vop3_mod(0x12B, 5, vgpr(1), vgpr(2), 0, abs, neg, 0, false));
+        body.push(vop1(0x001, 0, vgpr(5)));
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &cases, |backend, i, _, got| {
+            let want = if neg != 0 { ROWS[i].1 } else { ROWS[i].2 };
+            assert!(
+                got == want || nan(got) && nan(want),
+                "{backend}: {label} row {i}: {got:#010x}, want {want:#010x}"
+            );
+        });
+    }
+}
