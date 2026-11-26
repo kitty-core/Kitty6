@@ -12,10 +12,12 @@ use anyhow::{Context, Result, bail};
 
 // (The translator's one file is 570 KiB of source.)
 const MAX_FILE_SIZE: usize = 640 * 1024;
+/// The largest picture in docs/media (Kitty6's media exception).
+const MAX_MEDIA_SIZE: usize = 300 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
-    "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    "rs", "toml", "md", "txt", "py", "svg", "k6mod", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
@@ -148,6 +150,19 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let mut problems = Vec::new();
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    // Kitty6's media exception (docs/asset-policy.md): small, downscaled
+    // pictures of the runtime's output for bug reports and tool screenshots,
+    // in docs/media only, as PNG or JPEG.
+    if path.starts_with("docs/media/") && matches!(ext.as_deref(), Some("png" | "jpg" | "jpeg")) {
+        let picture = content.starts_with(b"\x89PNG\r\n\x1a\n") || content.starts_with(b"\xff\xd8\xff");
+        if !picture {
+            problems.push("not a PNG or JPEG".to_owned());
+        }
+        if content.len() > MAX_MEDIA_SIZE {
+            problems.push(format!("{} bytes exceeds the {MAX_MEDIA_SIZE}-byte media limit", content.len()));
+        }
+        return problems;
+    }
     let allowed = ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()
@@ -236,6 +251,16 @@ mod tests {
         assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
+    }
+
+    #[test]
+    fn media_pictures_only_small_and_in_docs_media() {
+        let png = [&b"\x89PNG\r\n\x1a\n"[..], &[0u8; 64]].concat();
+        assert!(check("docs/media/purple.png", &png).is_empty());
+        assert!(!check("docs/purple.png", &png).is_empty(), "outside docs/media");
+        assert!(!check("docs/media/fake.png", b"DDS \x7c").is_empty(), "not a picture");
+        let big = [&png[..], &vec![1u8; 400 * 1024]].concat();
+        assert!(!check("docs/media/big.png", &big).is_empty(), "too big");
     }
 
     #[test]
