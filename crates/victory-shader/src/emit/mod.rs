@@ -1022,7 +1022,7 @@ mod tests {
     /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
     /// is installed.
     #[cfg(windows)]
-    fn dump_dxil(container: &[u8]) -> Option<String> {
+    pub(super) fn dump_dxil(container: &[u8]) -> Option<String> {
         let dxc = match std::env::var_os("VICTORY_PC_DXC") {
             Some(p) => std::path::PathBuf::from(p),
             None => super::validator::Validator::default_path()?.with_file_name("dxc.exe"),
@@ -1030,7 +1030,10 @@ mod tests {
         if !dxc.exists() {
             return None;
         }
-        let file = std::env::temp_dir().join(format!("victory-interp-{}.dxil", std::process::id()));
+        // One file per call: tests that dump run on several threads at once.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let file = std::env::temp_dir().join(format!("victory-interp-{}-{n}.dxil", std::process::id()));
         std::fs::write(&file, container).ok()?;
         let out = std::process::Command::new(dxc)
             .arg("-dumpbin")
@@ -3292,5 +3295,123 @@ mod early_depth_tests {
         assert!(!super::lower::early_depth(&ps(0x1150), &[]));
         assert!(!super::lower::early_depth(&ps(0x1050), &[el("SV_StencilRef", 20, 1)]));
         assert!(!super::lower::early_depth(&StageIo::None, &[]));
+    }
+}
+
+/// The DXIL `dxc -dumpbin` prints for small pixel programs, for the picture
+/// fixes ported from Scarlett that have no other way to be seen in a test.
+#[cfg(all(test, windows))]
+mod picture_fix_tests {
+    use super::container::SigElement;
+    use crate::native::{
+        HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
+    };
+
+    /// `words`, a pixel program writing one float colour target, with a
+    /// table of one 8-dword view at s9, as `dxc -dumpbin` prints it (None
+    /// without dxc).
+    fn dumped(words: &[u32]) -> Option<String> {
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 16,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 9,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 9,
+                slot: 0,
+            }],
+            io: StageIo::Ps { inputs: vec![], input_addr: 0, db_shader_control: 0x50, patches: vec![] },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let out = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let osg1 = super::container::signature(&[out], false);
+        let bytes = crate::dxbc::build(&[(super::FourCC::OSG1, &osg1)]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let dxil = super::emit(&c, &native, &p, &st, &io, &res).unwrap().dxil;
+        let text = super::tests::dump_dxil(&dxil);
+        if text.is_none() {
+            eprintln!("no dxc (VICTORY_PC_DXC); the DXIL was not looked at");
+        }
+        text
+    }
+
+    /// (Neptune 25fbf69, `VICTORY_NAN_GUARD`) A float colour export is
+    /// tested for NaN and infinity (exponent all ones, 0x7F800000) and an
+    /// infinity made +-65504 (0x477FE000); =0: exported as it is.
+    #[test]
+    fn a_float_colour_export_turns_nan_and_infinity_into_numbers() {
+        // A texel, not a constant: a guard of a constant is folded away.
+        let words = [
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF40C_0001,
+            0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+            0x7E0C_0280, // v_mov_b32 v6, 0
+            0xF000_1100,
+            0x0000_0D06, // image_load v13, v6, s[0:7] dmask:0x1
+            0xBF8C_0000, // s_waitcnt 0
+            0xF800_180F,
+            0x0D0D_0D0D, // exp mrt0 v13, v13, v13, v13 done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        let Some(text) = dumped(&words) else { return };
+        assert!(
+            text.contains("2139095040") && text.contains("1199562752"),
+            "no NaN guard on the colour export:\n{text}"
+        );
+    }
+
+    /// (Scarlett, `VICTORY_D16_BITS`) A d16 image load keeps the low 16 bits
+    /// of what an integer view returns (a value up to 0xFFFF, or from
+    /// 0xFFFF8000) instead of converting them as a float; =0: converted.
+    #[test]
+    fn a_d16_image_load_keeps_an_integer_views_bits() {
+        let words = [
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF40C_0001,
+            0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+            0x7E0C_0280, // v_mov_b32 v6, 0
+            0xF000_1100,
+            0x8000_0D06, // image_load v13, v6, s[0:7] dmask:0x1 d16
+            0xBF8C_0000, // s_waitcnt 0
+            0xF800_180F,
+            0x0D0D_0D0D, // exp mrt0 v13, v13, v13, v13 done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        let Some(text) = dumped(&words) else { return };
+        assert!(text.contains("legacyF32ToF16"), "the d16 load is not converted at all:\n{text}");
+        assert!(
+            text.contains("65535") && text.contains("-32769"),
+            "the d16 load's integer bits are converted as a float:\n{text}"
+        );
     }
 }

@@ -6124,6 +6124,41 @@ mod window_tests {
         // SAFETY: our own reservation, nothing else uses it.
         assert_ne!(unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) }, 0);
     }
+
+    /// A 4 MiB cell of a fresh reservation, with `committed` bytes of it
+    /// committed from the cell on (the reservation stays; the test owns it).
+    fn committed_cell(committed: u64) -> u64 {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        // SAFETY: a fresh reservation of our own; one cell of slack to align.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), (40 << 20) as usize, MEM_RESERVE, PAGE_READWRITE) } as u64;
+        assert_ne!(base, 0);
+        let cell = base.next_multiple_of(WINDOW);
+        // SAFETY: inside the reservation just made.
+        let done = unsafe { VirtualAlloc(cell as *const _, committed as usize, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!done.is_null());
+        cell
+    }
+
+    /// A root view into 12 MiB of committed memory is given a window over
+    /// all of it, not its 4 MiB cell alone (`VICTORY_ROOT_WINDOW_MB=4`: the
+    /// cell, as before).
+    #[test]
+    fn a_root_view_window_covers_the_memory_committed_after_its_cell() {
+        let cell = committed_cell(12 << 20);
+        assert_eq!(super::root_window(cell + 0x100, cell + 0x104), (cell, 12 << 20), "the root view's window is its cell alone");
+    }
+
+    /// What was found committed around a root view is used again within
+    /// `VICTORY_ROOT_REACH_MS` (=0: asked anew every time).
+    #[test]
+    fn a_root_view_reach_is_used_again_within_its_time() {
+        use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+        let cell = committed_cell(12 << 20);
+        assert_eq!(super::root_window(cell, cell + 4), (cell, 12 << 20));
+        // SAFETY: the upper 8 MiB of our own commitment, nothing reads it.
+        assert_ne!(unsafe { VirtualFree((cell + WINDOW) as *mut _, (8 << 20) as usize, MEM_DECOMMIT) }, 0);
+        assert_eq!(super::root_window(cell, cell + 4), (cell, 12 << 20), "the reach was asked of Windows again");
+    }
 }
 
 /// For device-removed reports: the copy of title memory whose host range
