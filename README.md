@@ -1,157 +1,108 @@
-# VIctory on an RX 7900 XTX
+# Kitty6
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
+A fork of [VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)
+(itself a fork of [VIctory](https://github.com/Marvisak/VIctory)), a
+compatibility layer that runs an Xbox Series title natively on Windows from
+files the user supplies, tuned for a **mid-range NVIDIA PC: an RTX 4070 (12 GB)
+with 32 GB of RAM**.
 
-## The goal
+Nothing from the game is in this repository: only the code that loads,
+translates and runs the files you supply ([docs/asset-policy.md](docs/asset-policy.md)).
 
-**A stable 30 fps or more without ray tracing, then as high a frame rate and as
-low frame times as the PC allows**, on an AMD RX 7900 XTX first and on PCs with
-32 GB (later 16 GB) of RAM.
+## Where it stands (26 November 2026)
 
-The way there is **porting, not emulating**: patching the title's renderer so it
-behaves the way a PC renderer does, rather than having the layer watch and copy
-the console's shared memory every frame. Shaders are translated ahead of time
-into a versioned store that is kept between builds. Ray tracing stays optional
-and off by default. The picture comes after the frame rate: texture pop-in and
-lighting that is too bright or too dark when walking indoors are next in line.
+**Not playable yet.** In-game, with a recognisable picture, below a steady 30 fps.
 
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's developer
-or publisher.
+Measured on one PC: RTX 4070 12 GB (driver 610.88), 32 GB RAM, Windows 11 23H2,
+the smaller console's profile (`scripts\play.ps1 -Lean`) unless said otherwise.
+These are the maintainer's own figures from runs of about 4 to 5 minutes; none
+is a played session yet, and nobody else has reproduced them.
 
-## Where it stands (2026-11-26)
-
-Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, ray tracing off.
-
-| | |
+| What | Frame rate |
 |---|---|
-| City street, Series S profile, renderer patches 1, 2, 5, 6 and 7 on | about 45 ms a frame (about 22 fps, 44.9 ms in run merge-5) |
-| Same, patches 1, 2, 5 and 6 | 45.6 ms, p95 47 ms |
-| Same, patches 1, 2 and 5 | 47.3 ms (about 21 fps), p95 49 ms |
-| Series X profile, patches 1+2 | about 53 ms (about 19 fps) |
-| Same scene before the patches | 57-75 ms (13-17 fps) |
-| Shaders the title uses that translate | all of them (25,790 of 25,985; the rest are unused geometry shaders) |
-| Memory | about 30 GB of private memory, 10.5 GB of VRAM: **64 GB of RAM recommended** for now |
+| Opening scene, Series S profile, standing (frame-rate line, 1 s samples) | 20.5 fps median (48.7 ms) |
+| Scripted walking, turning, running (`-Drive`, automated, not play) | 24 to 28 fps, dips to 13 |
+| Series X profile at 1080p output (`-Console X -Output 1920x1080`), scripted | 18 to 22 fps |
+| Session length without a crash | runs of about 5 minutes so far (no long session yet) |
 
-It started at 280 ms a frame in the same scenes three days earlier. What sets
-the frame now is the one thread that submits the title's work to the card
-(about 40 ms); the card itself needs about 36 ms and now waits about 7 ms a frame with nothing queued.
+How it got here on this PC, in the order found:
 
-### Renderer patches (off by default while they are tested)
+- **4 fps to 15-20 fps**: buffer and window copies in the card's unused memory
+  (`VICTORY_CARD_BUFFERS_MB=1536`, `VICTORY_CARD_WINDOWS_MB=1024`).
+- **3-5 fps to 18-19 fps**: a lock found with our own sampling profiler
+  (`tools/kitty6-prof`): every miss in the copies of buffer views' bytes made a
+  buffer and waited for the card while holding a global lock, and the 8 recording
+  threads spent about 75% of their time queued on it. Freed copies are now reused
+  by size, outside the lock.
+- **21 MB less sent each frame**: a 20 MB buffer that shaders rewrite every
+  frame, outside the watched memory, is compared and only changed bytes go up.
+- **19.7 to 20.5 fps**: upstream's NVIDIA descriptor-slot work (avatarmanz PR #237)
+  and texture read-back tracking (PR #150).
+- Two of the compute shaders the RTX 4070 refused (they kept a 64-lane wave size)
+  now run in waves of 32 (`VICTORY_LDS_REGIONS`, on).
 
-| Switch | What it does |
-|---|---|
-| `VICTORY_PORT_CONSTANTS=1` | The title's 174 MB constants heap is read by the card where the title writes it: no uploads, no fills |
-| `VICTORY_PORT_DESCRIPTORS=1` | The title's descriptor-table stores are patched (byte-checked) to report the slots they write, instead of a scan of ~600,000 slots a frame |
-| `VICTORY_PORT_CBV=1` | Translated shaders read constant buffers in place as raw bytes (~22,000 fills a frame to none; -4.7 ms) |
-| `VICTORY_PORT_GUARD=1` | The write guards' lock is shared by faults and refreshes, with a claim per 64 KiB block; the submission's planning runs beside it (title threads' waits 29 ms to ~2 ms a frame; -2 ms) |
-| `VICTORY_PORT_JOURNAL=1` | The heaps' records are asked for at the title's submit, and the journal's notes are split into 64 parts with locks of their own (the submit thread's waits ~5 ms + 1 ms to ~0.3 ms; -1 to -3 ms) |
-
-### Other switches
-
-| Switch | What it does |
-|---|---|
-| `--console series-s` | The Series S profile: 1080p output, about 5 ms faster, a softer picture |
-| `VICTORY_OUTPUT=1920x1080` | The title renders to that output size itself (Series X profile; about 16 ms less card time) |
-| `VICTORY_FRAME_INTERVAL_MS=16.667` | Lets the title go above 30 fps (menus and videos reach 60; the game's clock stays right) |
-| `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
-| `VICTORY_TEXTURE_STORE=1` | Converted textures kept between runs (about 8 ms a frame for now: off) |
-
-What is known to be wrong:
-
-- Trees, signs and far objects flicker in the distance in some places.
-- Lighting is too bright or too dark after walking indoors, until the title has
-  run for a while; rooms with little direct light are too dark without `-RayTracing`.
-- Textures of what just came into view appear late while the title streams.
-- The first run of a new build stutters while the driver makes pipelines
-  (`victory warm` makes them ahead).
-- Recording a frame in the world makes the title's own watchdog end it.
+Known problems: blocky, stair-stepped light and shadow tiles on some walls; purple
+glow patches indoors; four compute shaders still refused on NVIDIA; mouths only
+just got the upstream fix (PR #114) and are not checked yet. The frame is bound by
+CPU and GPU memory coherence: about 25 MB up and 35-47 MB fetched back per frame,
+and the submitting thread waits for the card about a third of the frame.
 
 ## How to run it
 
-You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
-model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
-tools, and your own dump of the title.
+You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader model
+6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build tools, and
+your own dump of the title.
 
 ```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
+git clone https://github.com/kitty-core/Kitty6
+cd Kitty6
 copy victory.example.toml victory.toml      # then set your paths, outside this folder
 cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path of your copy's executable>
+scripts\play.ps1 -Exe <path of your copy's executable> -Lean
 ```
 
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. On a PC with 32 GB of RAM or less, `-Lean` runs the Series
-S profile with the memory-saving switches, and `-Probe` records a row a second of
-what the PC is short of (paging, the card's memory, pipelines, one busy thread):
-[docs/probes.md](docs/probes.md). `-Overlay` puts the Kitty6 Overlay, a live HUD of the
-same numbers, over the game window (build it with `cargo build --profile diag -p kitty6-overlay`;
-F6 hides and shows it). `-RayTracing` turns the title's ray-traced indirect light on.
+Launcher settings (`scripts\play.ps1`):
 
-On a hybrid-graphics PC, the runtime and offline pipeline checks prefer a
-high-performance adapter with Shader Model 6.6. The runtime logs its adapter
-name, PCI vendor and device IDs, and dedicated VRAM. Set
-`VICTORY_D3D12_ADAPTER` to a zero-based DXGI index or part of the adapter's
-name to select it explicitly. With the launcher, pass
-`-More @{VICTORY_D3D12_ADAPTER='NVIDIA'}`.
+| Option | What it does |
+|---|---|
+| `-Lean` | Settings for 32 GB of RAM and a 12-16 GB card (Series S profile, card-memory copies, upstream's renderer patches) |
+| `-Console X` / `-Console S` | Pick the console profile; X is the sharper picture |
+| `-Output 1920x1080` | The title renders at that output size itself (Series X profile) |
+| `-Quality Low/Medium/High` | Texture detail (Medium is what `-Lean` sets) |
+| `-Fps 60` / `-Fps 0` | Lift the title's 30 fps cap (off by default) / no cap at all |
+| `-Panel` | The run's numbers drawn on the picture; F3 hides and shows them |
+| `-F8Timeline` | F8 in game records a 3-frame timeline of where the frame's time went |
+| `-Drive` | Scripted walking, turning, running and jumping, for measurements in motion |
+| `-Overlay` | The Kitty6 overlay (F6): live graphs of the run |
+| `-Probe` | A per-second CSV of frame times; compare runs with `victory probe-report` |
 
-Before the first run, ahead of time (both can be stopped and go on later):
+More on running, the commands and every switch: [docs/README-7900XTX.md](docs/README-7900XTX.md)
+(upstream's README) and [docs/README-fxceless.md](docs/README-fxceless.md). Every
+`VICTORY_...` switch is described in a comment where it is read.
 
-```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
-target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
-```
+## Tools made here
 
-Commands, debugging switches and upstream's own description:
-[docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
-described in a comment where it is read.
-
-## What is different here
-
-In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
-
-- **List calls are written down, not carried out, on the title's threads**
-  (`VICTORY_THIN`): eight threads of ours translate them.
-- **Submissions are prepared by a thread of ours and joined**
-  (`VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`), with what can be spread over
-  threads spread: refreshes, compares (AVX2), descriptor records, landings.
-- **What shaders wrote comes back beside the write guards**, by the dwords that
-  changed, on a thread of its own (`VICTORY_RELAY`, `VICTORY_LAND`).
-- **Buffer fills that need bytes still on the card are done on the card**
-  (`VICTORY_CARD_STEPS`) instead of waiting for it.
-- **The title's writes are caught more cheaply**: one view opened at a fault,
-  blocks that rest, places in the title's code that look before they write.
-- **Textures go up on a copy queue of their own** and a slot shows one only after
-  its upload ran, which also ended a device loss that came every 15 minutes or so.
-- **Boats float**: textures that shaders write and the title's CPU reads go back
-  to title memory (from fxceless and Geckomacabre, on by default here).
-- **Frame record and replay** with per-pass times and shader variants compared
-  turn by turn ([docs/replay.md](docs/replay.md)).
+- `tools/kitty6-prof`: samples every thread's stack of the running process, with
+  names from the PDB: per thread what it runs or waits in, call chains, and
+  `--focus` for what runs under one function.
+- `apps/kitty6-overlay`: live graphs of the run in a window beside the game.
+- The in-picture panel (`-Panel`), F8 timelines (`-F8Timeline`), scripted input
+  (`-Drive`, `VICTORY_KEYS`) and per-buffer traffic reports in the log.
 
 ## Credits
 
 This is a tree of other people's work with more on top. The history is kept, and
 commits taken from elsewhere name the commit and its author.
 
-- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors: the loader, the runtime services, the Direct3D 12 back end and
-  the shader recompiler.
-- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
-  this one started from, and the people whose pull requests it carries.
-- **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
-  cube gradients, sparse textures.
-- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
-  the ambient light idea, pipeline workers, and work by romainhedouin.
-- **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**.
-- **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: the guard over
-  every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's
-  reads into title memory.
-- **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
-- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
-  title behaves under another layer; no code of it is here.
+- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its contributors.
+- **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)**:
+  the tree this one starts from, and everyone it credits
+  ([docs/README-7900XTX.md](docs/README-7900XTX.md#credits)), among them
+  fxceless/victory-fork, DexNom, Belobug, FQY55kai, myokex, Geckomacabre and
+  cxy0072019-sketch.
+- Upstream pull requests carried here: #237 and #150 (NVIDIA descriptors, texture
+  read-back), #114 (faces), #329 (picture fixes via RYUKI-7900XT), #314 (ambient
+  reflections), by their authors.
 - This fork's changes were made with [Claude Code](https://claude.com/claude-code).
 
 ## License

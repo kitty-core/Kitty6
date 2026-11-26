@@ -1438,6 +1438,8 @@ fn pair_meetings_only_change_programs_lowered_with_them() {
     let a = lowered(&one, &p1, &wide).expect("lower");
     let b = lower::with_pair_meetings(|| lowered(&one, &p1, &wide)).expect("lower");
     assert_eq!(a.dxil, b.dxil);
+}
+
 /// DS `op vdst, addr, data0` at byte offset `offset`.
 const fn ds_at(op: u8, vdst: u8, addr: u8, data0: u8, offset: u16) -> [u32; 2] {
     let [w0, w1] = ds(op, vdst, addr, data0);
