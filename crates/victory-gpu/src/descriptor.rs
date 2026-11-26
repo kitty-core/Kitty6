@@ -1901,7 +1901,7 @@ mod tests {
         };
         assert_ne!(offset, u32::MAX, "the table found no dynamic slots");
         let next = host_heap.dynamic(1).expect("a dynamic slot");
-        host_heap.release(next, 1);
+        host_heap.release(host_heap.id(), next, 1);
         drop(state);
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         assert_eq!(
