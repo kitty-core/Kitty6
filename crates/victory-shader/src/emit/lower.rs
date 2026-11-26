@@ -1853,6 +1853,48 @@ fn f16_nearest_on() -> bool {
 thread_local! {
     /// A test's choice for [`f16_nearest_on`], for its thread only.
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`half_views_on`], for its thread only.
+    pub(super) static TEST_HALF_VIEWS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`half_loads_on`], for its thread only.
+    pub(super) static TEST_HALF_LOADS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_HALF_VIEWS=0`: halves moved through a 16-bit table view
+/// (`buffer_load/store_format_d16_*`) go by way of 32-bit floats as before
+/// the half views (68cef8b1, ee7694eb, 6779c11f), and no view is named in
+/// [`super::HostShader::half_views`]; it also turns off [`half_loads_on`],
+/// which needs the views. On by default. Ported from PastiiJay/klbf-lab
+/// PR #113 (Adiker): an opt-out where the views distort mouths. Part of the
+/// shader cache key when off (victory-gpu `shader_cache::build`).
+pub fn half_views_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_HALF_VIEWS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| switch_not_zero(std::env::var_os("VICTORY_HALF_VIEWS").as_deref()))
+}
+
+/// `K6_HALF_LOADS=0`: a format load of whole dwords whose result is read
+/// only as halves loads floats as before a20904cd, instead of the 16-bit
+/// integers through a half view ([`Lower::places_read_as_halves`]). On by
+/// default; off whenever [`half_views_on`] is. Part of the shader cache key
+/// when off.
+pub fn half_loads_on() -> bool {
+    if !half_views_on() {
+        return false;
+    }
+    #[cfg(test)]
+    if let Some(on) = TEST_HALF_LOADS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| switch_not_zero(std::env::var_os("K6_HALF_LOADS").as_deref()))
+}
+
+/// On unless the switch is exactly `0`. Pure, for testing.
+fn switch_not_zero(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
 }
 
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
@@ -3185,7 +3227,9 @@ impl<'a> Lower<'a> {
             }
         }
         self.find_coherent();
-        self.halves_only = self.places_read_as_halves();
+        if half_loads_on() {
+            self.halves_only = self.places_read_as_halves();
+        }
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
@@ -7635,7 +7679,7 @@ impl<'a> Lower<'a> {
                     let halves = self
                         .table_place(&Source::Loaded { load: site, first })
                         .is_some_and(|p| {
-                            un.contains("_format_d16_")
+                            (un.contains("_format_d16_") && half_views_on())
                                 || (self.halves_only.contains(&p)
                                     && self.format_load_read_as_halves(ui))
                         });
@@ -12933,7 +12977,8 @@ impl<'a> Lower<'a> {
         // program's reads of the face network's output), where every
         // access through its view does ([`Self::places_read_as_halves`]).
         let place = typed.then(|| self.table_place(src)).flatten().filter(|p| {
-            d16 || (self.halves_only.contains(p) && self.format_load_read_as_halves(inst))
+            (d16 && half_views_on())
+                || (self.halves_only.contains(p) && self.format_load_read_as_halves(inst))
         });
         let halves = place.is_some();
         if let Some(place) = place {
@@ -14110,6 +14155,16 @@ mod tests {
         let new_v1 = swap.write(Reg::V(1)).unwrap();
         let uniform = super::lane_uniform(&p, &st, &[true], Some(old_v0));
         assert!(!uniform.contains(&new_v1));
+    }
+
+    #[test]
+    fn half_switches_stay_on_unless_exactly_zero() {
+        use std::ffi::OsStr;
+        assert!(super::switch_not_zero(None));
+        assert!(!super::switch_not_zero(Some(OsStr::new("0"))));
+        for value in ["", "1", "other"] {
+            assert!(super::switch_not_zero(Some(OsStr::new(value))));
+        }
     }
 
     #[test]

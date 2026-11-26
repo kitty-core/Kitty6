@@ -2242,8 +2242,16 @@ fn rdna_forms_give_what_the_spelled_out_ones_give() {
 /// plain 16-bit integers (the title keeps both in such buffers; the
 /// network that moves its faces reads indices this way). A program that
 /// moves no halves names nothing.
+/// Picks `VICTORY_HALF_VIEWS` and `K6_HALF_LOADS` for this test's thread
+/// (each test runs on its own thread), whatever the environment says.
+fn halves_mode(views: bool, loads: bool) {
+    lower::TEST_HALF_VIEWS.set(Some(views));
+    lower::TEST_HALF_LOADS.set(Some(loads));
+}
+
 #[test]
 fn halves_go_through_a_table_as_they_are_and_name_their_views() {
+    halves_mode(true, true);
     use super::host::Stride;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_UINT;
     /// MUBUF `op vdata, vaddr, s[srsrc:srsrc+3], 0 idxen`.
@@ -2412,6 +2420,7 @@ fn halves_go_through_a_table_as_they_are_and_name_their_views() {
 /// it reads, and in which format, is known only then.
 #[test]
 fn half_places_are_the_descriptors_the_program_loads() {
+    halves_mode(true, true);
     /// MUBUF `op vdata, vaddr, s[srsrc:srsrc+3], 0 idxen`.
     const fn mubuf_idxen(op: u32, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
         [
@@ -2499,6 +2508,10 @@ fn half_places_are_the_descriptors_the_program_loads() {
     fixed.extend_from_slice(&mubuf_idxen(STORE_D16_XYZW, 1, 0, 12));
     fixed.push(S_ENDPGM);
     assert_eq!(lowered(&fixed).half_views, [(1, 8), (1, 16)]);
+    // VICTORY_HALF_VIEWS=0: the d16 accesses go by way of floats, no views.
+    halves_mode(false, true);
+    assert!(lowered(&fixed).half_views.is_empty());
+    halves_mode(true, true);
     // The load's offset in s20, from the first lane's thread index
     // (`v_readfirstlane_b32 s20, v0`): picked at run time.
     let mut runtime = vec![s_mov_b32(5, 0x80), vop1(0x02, 20, vgpr(0))];
@@ -2521,6 +2534,7 @@ fn half_places_are_the_descriptors_the_program_loads() {
 /// out of, as hundreds of the title's pixel programs do).
 #[test]
 fn a_format_load_read_as_halves_loads_the_integer() {
+    halves_mode(true, true);
     use super::host::Stride;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16_UINT;
     /// MUBUF `op vdata, vaddr, s[srsrc:srsrc+3], 0 idxen`.
@@ -2617,6 +2631,12 @@ fn a_format_load_read_as_halves_loads_the_integer() {
     let half = vop1(V_CVT_F32_F16, 2, vgpr(1));
     let as_halves = lowered(&[&load[..], &[half]].concat());
     assert_eq!(as_halves.half_views, [(1, 0)]);
+    // K6_HALF_LOADS=0, or VICTORY_HALF_VIEWS=0: the float path as before.
+    halves_mode(true, false);
+    assert!(lowered(&[&load[..], &[half]].concat()).half_views.is_empty());
+    halves_mode(false, true);
+    assert!(lowered(&[&load[..], &[half]].concat()).half_views.is_empty());
+    halves_mode(true, true);
     let as_float = lowered(&[&load[..], &[vop2(V_ADD_F32, 2, vgpr(1), 1)]].concat());
     assert!(as_float.half_views.is_empty());
     // v3 = first[v0] too, read as a whole float: v2 = half(v1) + v3.

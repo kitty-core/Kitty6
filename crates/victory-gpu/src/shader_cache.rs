@@ -149,6 +149,15 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::rt_miss() {
             bytes.extend_from_slice(b"VICTORY_RT_MISS=1");
         }
+        // The half views (`VICTORY_HALF_VIEWS=0`: 16-bit view accesses go by
+        // way of floats) and the format loads read as halves
+        // (`K6_HALF_LOADS=0`). Only when off, so the translations
+        // cached with both on keep their key.
+        if !victory_shader::emit::half_views_on() {
+            bytes.extend_from_slice(b"VICTORY_HALF_VIEWS=0");
+        } else if !victory_shader::emit::half_loads_on() {
+            bytes.extend_from_slice(b"K6_HALF_LOADS=0");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();

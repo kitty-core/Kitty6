@@ -118,7 +118,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
+pub use lower::{half_loads_on, half_views_on, host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -1184,6 +1184,19 @@ mod tests {
             "clamp saturates the result"
         );
         assert!(!low.contains("dx.op.unary.f32(i32 7"));
+    }
+
+    #[test]
+    fn half_view_switch_is_part_of_the_shader_cache_fingerprint() {
+        for name in ["VICTORY_HALF_VIEWS"] {
+            assert!(env!("VICTORY_SHADER_SWITCHES").split(',').any(|switch| switch == name));
+            let mut entry = format!("{name}=").into_bytes();
+            if let Some(value) = std::env::var_os(name) {
+                entry.extend_from_slice(value.as_encoded_bytes());
+            }
+            entry.push(0);
+            assert!(super::translation_fingerprint().windows(entry.len()).any(|part| part == entry));
+        }
     }
 
     #[test]
