@@ -9,3 +9,9 @@
 #
 # scripts\play.ps1 passes every mods\*.k6mod unless -NoMods. In game, F4 then
 # the MODS item turns all rules off and on (VICTORY_DEV=<s>:mods in a script).
+
+# 02384a60fda6f2d0: one 1x1x1 compute dispatch that costs ~10.9 ms a frame on
+# NVIDIA (a 64-lane program run as a single group). Skipping it outright bought
+# ~3 fps with no visible change in the opening scene. A single-group pass is
+# often an average (exposure-style), so run it every 4th frame instead of never.
+02384a60fda6f2d0 every 4
