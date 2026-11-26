@@ -101,10 +101,6 @@ impl Kind {
             Kind::Other => "other",
         }
     }
-
-    pub fn from_name(s: &str) -> Option<Kind> {
-        Kind::ALL.into_iter().find(|k| k.name() == s)
-    }
 }
 
 const SYSTEM_MODULES: &[&str] = &[
@@ -391,7 +387,7 @@ pub fn is_foreign(frame: &str, exe: &str) -> bool {
 }
 
 /// Frames that start threads rather than say what they are for.
-fn is_runtime(frame: &str) -> bool {
+pub fn is_runtime(frame: &str) -> bool {
     is_system(frame)
         || is_thread_start(frame)
         || ["std::", "core::", "alloc::", "__scrt", "invoke_main", "mainCRTStartup", "__rust", "_beginthread", "thread_start"]

@@ -11,6 +11,7 @@
 //! See `USAGE` below for the options.
 
 mod analysis;
+mod diff;
 mod json;
 
 use std::collections::HashMap;
@@ -49,6 +50,7 @@ kitty6-prof: samples every thread's call stack of a running process
 usage:
   kitty6-prof [--pid N | --name victory.exe] [--seconds 20] [--hz 100]
               [--top 25] [--out report.txt] [--focus NAME]
+  kitty6-prof diff a.json b.json [--top 10] [--out FILE]
   kitty6-prof --resolve <image.exe> 0xOFFSET...
 
 sampling:
@@ -71,6 +73,10 @@ report:
   --fence PAT      extra frame-name pattern (repeatable) marking a kernel
                    event wait as a card fence wait (default patterns cover
                    victory_gpu::host/fence/queue and *fence*/*settle*)
+
+diff: two --json runs side by side, per role (and all threads): busy and
+waiting ms/s by kind, then the wait sites, busy-self and inclusive functions
+whose time changed most, in ms/s and percentage points of the role's samples.
 
 The report shows per thread: running share, waits by site (the first frame of
 ours above the wait primitive, with the wait kind: lock / event / fence /
@@ -615,6 +621,9 @@ fn main() {
     let all: Vec<String> = std::env::args().skip(1).collect();
     if all.first().map(String::as_str) == Some("--resolve") {
         return resolve_offline(&all[1..]);
+    }
+    if all.first().map(String::as_str) == Some("diff") {
+        std::process::exit(diff::run(&all[1..]));
     }
     let a = args(&all);
     let pid = a.pid.or_else(|| find_pid(&a.name)).unwrap_or_else(|| {
