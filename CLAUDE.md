@@ -1,5 +1,10 @@
 # Kitty6: how to work here
 
+**Every session, read [docs/scouting.md](docs/scouting.md) first and come back
+to it often**: scout the other forks' PRs and the tracker for memory and
+picture fixes, come at each problem from several sides, skip what isn't needed,
+and log what was tried.
+
 This tree is Kitty6, a fork of VIctory tuned to run one Xbox Series title well
 on a PC with 32 GB of RAM and an ~11 GB NVIDIA card. The aim is a stable,
 good-looking picture at the highest frame rate this PC can reach.
