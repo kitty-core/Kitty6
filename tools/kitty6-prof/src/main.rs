@@ -1,13 +1,18 @@
 //! kitty6-prof: a sampling profiler for a running process (victory.exe by
 //! default). Every few milliseconds each thread is suspended, its call stack
 //! walked with dbghelp (the diag build's PDB names our functions; the title's
-//! code shows as module+offset), and resumed. At the end it says, per thread
-//! and over all, where the samples fell: the leaf (what runs or waits now)
-//! and the callers that hold the most samples, so a thread that waits shows
-//! what it waits in and who asked.
+//! code shows as module+offset), and resumed. Stacks are kept as raw
+//! addresses while sampling (cheap) and named once at the end. The report
+//! says, per thread and over all, where the samples fell: the leaf, the
+//! callers that hold the most samples, and for samples that wait, on what
+//! (lock, event, card fence, sleep) and from where (the first frame of ours
+//! above the wait primitive).
 //!
-//!   kitty6-prof [--pid N | --name victory.exe] [--seconds 20] [--hz 100]
-//!               [--top 25] [--out report.txt]
+//! See `USAGE` below for the options.
+
+mod analysis;
+mod diff;
+mod json;
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -15,22 +20,78 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE};
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    CONTEXT, GetThreadContext, STACKFRAME64, StackWalk64, SYMBOL_INFOW, SymFromAddrW, SymFunctionTableAccess64,
-    SymGetModuleBase64, SymInitializeW, SymRefreshModuleList, SymSetOptions, AddrModeFlat,
+    AddrModeFlat, CONTEXT, GetThreadContext, STACKFRAME64, SYMBOL_INFOW, StackWalk64, SymFromAddrW,
+    SymFunctionTableAccess64, SymGetModuleBase64, SymInitializeW, SymLoadModuleExW, SymSetOptions,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, PROCESSENTRY32W, Process32FirstW,
     Process32NextW, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS, TH32CS_SNAPTHREAD, THREADENTRY32,
     Thread32First, Thread32Next,
 };
+use windows_sys::Win32::System::WindowsProgramming::QueryThreadCycleTime;
 use windows_sys::Win32::System::Threading::{
-    GetThreadDescription, OpenProcess, OpenThread, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, ResumeThread,
-    SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
+    GetThreadDescription, OpenProcess, OpenThread, PROCESS_QUERY_INFORMATION,
+    PROCESS_VM_READ, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_LIMITED_INFORMATION,
+    THREAD_SUSPEND_RESUME,
 };
+
+use analysis::{Profile, ThreadData};
 
 const IMAGE_FILE_MACHINE_AMD64: u32 = 0x8664;
 const CONTEXT_FULL: u32 = 0x0010_000B;
 const MAX_FRAMES: usize = 48;
+/// Cycles a thread may show after its suspension ends without having run
+/// code of its own (measured: 2.5-8k; a wake and wait again costs more).
+const APC_TAIL: u64 = 12_000;
+
+const USAGE: &str = "\
+kitty6-prof: samples every thread's call stack of a running process
+
+usage:
+  kitty6-prof [--pid N | --name victory.exe] [--seconds 20] [--hz 100]
+              [--top 25] [--out report.txt] [--focus NAME]
+  kitty6-prof diff a.json b.json [--top 10] [--out FILE]
+  kitty6-prof --resolve <image.exe> 0xOFFSET...
+
+sampling:
+  --pid N          process id (default: the first process named --name)
+  --name EXE       process name (default victory.exe)
+  --seconds S      how long to sample (default 20)
+  --hz H           samples per thread per second (default 100; 50 is plenty
+                   for a 20 s run and costs the sampler less CPU)
+report:
+  --top N          rows in the all-threads tables (default 25)
+  --out FILE       also write the text report to FILE
+  --focus NAME     what runs under the frames whose name contains NAME
+  --json FILE      per-thread and per-role samples, busy/wait counts by
+                   kind, self and inclusive counts per function, waits by
+                   site (input of `kitty6-prof diff`)
+  --folded FILE    stacks in the folded format, root first, one line each:
+                   `thread [role];outer;...;leaf count` (samples that wait
+                   end in a `[wait: kind]` frame); tools/charts/flame.py
+                   draws it
+  --fence PAT      extra frame-name pattern (repeatable) marking a kernel
+                   event wait as a card fence wait (default patterns cover
+                   victory_gpu::host/fence/queue and *fence*/*settle*)
+
+diff: two --json runs side by side, per role (and all threads): busy and
+waiting ms/s by kind, then the wait sites, busy-self and inclusive functions
+whose time changed most, in ms/s and percentage points of the role's samples.
+
+The report shows the sampler's own cost, then per thread: running share,
+waiting split by kind; per role (submission, list recorders, pools, title
+threads, ... from the thread description or entry function): busy and
+waiting %, top self and inclusive functions, waits by site; waits by site over
+all threads (the first frame of ours above the wait primitive, with the kind:
+lock / event / fence / sleep / idle / message); per thread what it runs, call
+chains and inclusive functions. Times are thread-ms per second of wall time
+(a thread waiting the whole time is 1000 ms/s) and % of the samples.
+
+A/B: run with --json a.json, change the build or a switch, run with
+--json b.json, then `kitty6-prof diff a.json b.json`. Flame graph:
+python tools/charts/flame.py prof.folded prof.svg [--per-role DIR].
+See docs/profiling.md.
+";
 
 #[repr(C, align(16))]
 struct Ctx(CONTEXT);
@@ -40,27 +101,50 @@ struct Args {
     name: String,
     seconds: f64,
     hz: f64,
-    top: usize,
+    opts: analysis::Options,
     out: Option<String>,
-    focus: Option<String>,
+    json: Option<String>,
+    folded: Option<String>,
 }
 
-fn args() -> Args {
-    let mut a = Args { pid: None, name: "victory.exe".into(), seconds: 20.0, hz: 100.0, top: 25, out: None, focus: None };
-    let mut it = std::env::args().skip(1);
+fn usage_exit(code: i32) -> ! {
+    if code == 0 {
+        print!("{USAGE}");
+    } else {
+        eprint!("{USAGE}");
+    }
+    std::process::exit(code)
+}
+
+fn args(list: &[String]) -> Args {
+    let mut a = Args {
+        pid: None,
+        name: "victory.exe".into(),
+        seconds: 20.0,
+        hz: 100.0,
+        opts: analysis::Options::default(),
+        out: None,
+        json: None,
+        folded: None,
+    };
+    let mut it = list.iter().cloned();
     while let Some(k) = it.next() {
-        let mut v = || it.next().unwrap_or_default();
+        let mut v = || it.next().unwrap_or_else(|| usage_exit(2));
         match k.as_str() {
             "--pid" => a.pid = v().parse().ok(),
             "--name" => a.name = v(),
             "--seconds" => a.seconds = v().parse().unwrap_or(20.0),
             "--hz" => a.hz = v().parse().unwrap_or(100.0),
-            "--top" => a.top = v().parse().unwrap_or(25),
+            "--top" => a.opts.top = v().parse().unwrap_or(25),
             "--out" => a.out = Some(v()),
-            "--focus" => a.focus = Some(v()),
+            "--json" => a.json = Some(v()),
+            "--folded" => a.folded = Some(v()),
+            "--focus" => a.opts.focus = Some(v()),
+            "--fence" => a.opts.fence.push(v().to_ascii_lowercase()),
+            "--help" | "-h" => usage_exit(0),
             _ => {
-                eprintln!("usage: kitty6-prof [--pid N | --name victory.exe] [--seconds 20] [--hz 100] [--top 25] [--out file]");
-                std::process::exit(2);
+                eprintln!("unknown option {k}");
+                usage_exit(2)
             }
         }
     }
@@ -117,8 +201,9 @@ fn threads(pid: u32) -> Vec<u32> {
     out
 }
 
-/// Modules of the process: (base, end, name), for addresses without symbols.
-fn modules(pid: u32) -> Vec<(u64, u64, String)> {
+/// Modules of the process: (base, end, file name, full path). The first is
+/// the exe.
+fn modules(pid: u32) -> Vec<(u64, u64, String, String)> {
     let mut out = Vec::new();
     // SAFETY: as above.
     unsafe {
@@ -128,7 +213,7 @@ fn modules(pid: u32) -> Vec<(u64, u64, String)> {
         if Module32FirstW(snap, &mut e) != 0 {
             loop {
                 let base = e.modBaseAddr as u64;
-                out.push((base, base + u64::from(e.modBaseSize), wide(&e.szModule)));
+                out.push((base, base + u64::from(e.modBaseSize), wide(&e.szModule), wide(&e.szExePath)));
                 if Module32NextW(snap, &mut e) == 0 {
                     break;
                 }
@@ -139,29 +224,9 @@ fn modules(pid: u32) -> Vec<(u64, u64, String)> {
     out
 }
 
-/// Modules of the process with their full paths.
-fn module_paths(pid: u32) -> Vec<(u64, u64, String)> {
-    let mut out = Vec::new();
-    // SAFETY: as in `modules`.
-    unsafe {
-        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-        let mut e: MODULEENTRY32W = std::mem::zeroed();
-        e.dwSize = size_of::<MODULEENTRY32W>() as u32;
-        if Module32FirstW(snap, &mut e) != 0 {
-            loop {
-                let base = e.modBaseAddr as u64;
-                out.push((base, base + u64::from(e.modBaseSize), wide(&e.szExePath)));
-                if Module32NextW(snap, &mut e) == 0 {
-                    break;
-                }
-            }
-        }
-        CloseHandle(snap);
-    }
-    out
-}
-
-fn thread_name(h: HANDLE, tid: u32) -> String {
+/// The thread's description (SetThreadDescription; Rust's thread names),
+/// numbered workers folded into one kind ("victory-list-3" -> "victory-list-#").
+fn thread_description(h: HANDLE) -> Option<String> {
     // SAFETY: the description is a LocalAlloc'd wide string we only read.
     unsafe {
         let mut p: windows_sys::core::PWSTR = std::ptr::null_mut();
@@ -173,36 +238,29 @@ fn thread_name(h: HANDLE, tid: u32) -> String {
             let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, n));
             windows_sys::Win32::Foundation::LocalFree(p as *mut c_void);
             if !s.is_empty() {
-                // Numbered workers are one kind.
-                return s.trim_end_matches(|c: char| c.is_ascii_digit() || c == '-').to_owned() + "#";
+                return Some(analysis::fold_number(&s));
             }
         }
     }
-    format!("(unnamed {tid})")
+    None
 }
 
 struct Symbols {
     process: HANDLE,
-    cache: HashMap<u64, String>,
+    /// (base, end, file name); the first is the exe, whose names go bare.
+    /// Frames of other modules are "module!name", or "module.dll+0xoffset"
+    /// without a symbol.
     modules: Vec<(u64, u64, String)>,
 }
 
 impl Symbols {
-    fn name(&mut self, addr: u64) -> String {
-        if let Some(s) = self.cache.get(&addr) {
-            return s.clone();
-        }
-        let s = self.resolve(addr);
-        self.cache.insert(addr, s.clone());
-        s
-    }
-
     fn resolve(&self, addr: u64) -> String {
         #[repr(C)]
         struct Sym {
             info: SYMBOL_INFOW,
             name: [u16; 512],
         }
+        let module = self.modules.iter().enumerate().find(|(_, (b, e, _))| addr >= *b && addr < *e);
         // SAFETY: a sized symbol buffer dbghelp fills.
         unsafe {
             let mut s: Sym = std::mem::zeroed();
@@ -211,18 +269,25 @@ impl Symbols {
             let mut disp = 0u64;
             if SymFromAddrW(self.process, addr, &mut disp, &mut s.info) != 0 {
                 let len = (s.info.NameLen as usize).min(512);
-                let name = String::from_utf16_lossy(std::slice::from_raw_parts(s.info.Name.as_ptr(), len));
-                return shorten(&name);
+                let name = shorten(&String::from_utf16_lossy(std::slice::from_raw_parts(s.info.Name.as_ptr(), len)));
+                return match module {
+                    Some((i, (_, _, m))) if i > 0 => {
+                        let stem = m.rsplit_once('.').map_or(m.as_str(), |(s, _)| s);
+                        format!("{}!{name}", stem.to_ascii_lowercase())
+                    }
+                    _ => name,
+                };
             }
         }
-        match self.modules.iter().find(|(b, e, _)| addr >= *b && addr < *e) {
-            Some((b, _, m)) => format!("{m}+{:#x}", addr - b),
+        match module {
+            Some((_, (b, _, m))) => format!("{m}+{:#x}", addr - b),
             None => format!("{addr:#x}"),
         }
     }
 }
 
-/// Drops generic arguments and hashes from Rust names.
+/// Drops generic arguments and hashes from Rust names; no ';' (the folded
+/// format's separator) or line breaks.
 fn shorten(name: &str) -> String {
     let mut out = String::new();
     let mut depth = 0;
@@ -230,6 +295,7 @@ fn shorten(name: &str) -> String {
         match c {
             '<' => depth += 1,
             '>' => depth -= 1,
+            ';' | '\n' | '\r' if depth == 0 => out.push(':'),
             _ if depth == 0 => out.push(c),
             _ => {}
         }
@@ -237,43 +303,87 @@ fn shorten(name: &str) -> String {
     out
 }
 
-/// Functions that only wait: a stack whose leaf is one of these is waiting,
-/// and the first frame above them says on what.
-fn is_wait(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
-    ["ntwaitfor", "ntdelayexecution", "zwdelayexecution", "tpworkonbehalf", "rtldllshutdown", "ntwaitforalert", "ntremovelo", "ntuserget", "ntusermsgwait", "zwwaitfor", "ntalertthread",
-        "rtlsleepcondition", "rtlacquiresrw", "rtlpwaitoncritical", "rtlpwaitonaddress", "ntwaitforalert",
-        "sleepconditionvariable", "waitforsingleobject", "waitformultipleobjects", "sleepex", "waitonaddress",
-        "ntsignalandwait", "rtlenter", "ntyieldexecution", "parking_lot", "futex", "std::sys::sync", "std::thread::park",
-        "kernelbase!", "ntdll!", "kernel32!"]
-        .iter()
-        .any(|w| n.contains(w))
-        || n.starts_with("ntdll.dll+")
-        || n.starts_with("kernelbase.dll+")
-        || n.starts_with("kernel32.dll+")
-        || n.starts_with("win32u.dll+")
+/// Reads of the target's memory for the stack walk, a page at a time and
+/// cached: pages of module images (code, unwind data) for the whole run,
+/// other pages (the stack) for one walk. dbghelp otherwise reads a few bytes
+/// per call, a system call each.
+struct PageCache {
+    images: Vec<(u64, u64)>,
+    keep: HashMap<u64, Option<Box<[u8; 4096]>>>,
+    walk: HashMap<u64, Option<Box<[u8; 4096]>>>,
+    reads: u64,
 }
 
-#[derive(Default)]
-struct Stats {
-    samples: u64,
-    leaf: HashMap<String, u64>,
-    /// First frame of ours (not a wait primitive) on the stack: what the
-    /// thread is doing or waiting for.
-    what: HashMap<String, u64>,
-    inclusive: HashMap<String, u64>,
-    /// "what <- caller <- caller" chains.
-    chains: HashMap<String, u64>,
-    waiting: u64,
+thread_local! {
+    static PAGES: std::cell::RefCell<PageCache> =
+        std::cell::RefCell::new(PageCache { images: Vec::new(), keep: HashMap::new(), walk: HashMap::new(), reads: 0 });
 }
 
-fn walk(process: HANDLE, thread: HANDLE) -> Vec<u64> {
+unsafe extern "system" fn read_memory(process: HANDLE, at: u64, buf: *mut c_void, size: u32, read: *mut u32) -> windows_sys::core::BOOL {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    PAGES.with_borrow_mut(|c| {
+        let mut done = 0u32;
+        while done < size {
+            let addr = at + u64::from(done);
+            let page = addr & !0xfff;
+            let image = c.images.iter().any(|(b, e)| page >= *b && page < *e);
+            let reads = &mut c.reads;
+            let map = if image { &mut c.keep } else { &mut c.walk };
+            let got = map.entry(page).or_insert_with(|| {
+                *reads += 1;
+                let mut p = Box::new([0u8; 4096]);
+                let mut n = 0usize;
+                // SAFETY: a 4 KiB buffer of ours.
+                let ok = unsafe { ReadProcessMemory(process, page as *const c_void, p.as_mut_ptr().cast(), 4096, &mut n) };
+                (ok != 0 && n == 4096).then_some(p)
+            });
+            let Some(p) = got else { break };
+            let off = (addr - page) as usize;
+            let take = (4096 - off).min((size - done) as usize);
+            // SAFETY: the caller's buffer holds `size` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(p.as_ptr().add(off), buf.cast::<u8>().add(done as usize), take) };
+            done += take as u32;
+        }
+        if !read.is_null() {
+            // SAFETY: the caller's count.
+            unsafe { *read = done };
+        }
+        (done == size) as windows_sys::core::BOOL
+    })
+}
+
+thread_local! {
+    /// Function table entries by return address (12-byte RUNTIME_FUNCTIONs,
+    /// copied: dbghelp's own buffer is reused), null for none.
+    static FUNCTIONS: std::cell::RefCell<HashMap<u64, Option<Box<[u32; 3]>>>> = std::cell::RefCell::new(HashMap::new());
+}
+
+unsafe extern "system" fn function_table(process: HANDLE, pc: u64) -> *mut c_void {
+    FUNCTIONS.with_borrow_mut(|m| {
+        let e = m.entry(pc).or_insert_with(|| {
+            // SAFETY: dbghelp returns null or a RUNTIME_FUNCTION we copy at once.
+            let p = unsafe { SymFunctionTableAccess64(process, pc) } as *const [u32; 3];
+            (!p.is_null()).then(|| Box::new(unsafe { *p }))
+        });
+        e.as_mut().map_or(std::ptr::null_mut(), |b| b.as_mut_ptr().cast())
+    })
+}
+
+unsafe extern "system" fn module_base(process: HANDLE, pc: u64) -> u64 {
+    let base = PAGES.with_borrow(|c| c.images.iter().find(|(b, e)| pc >= *b && pc < *e).map(|(b, _)| *b));
+    // SAFETY: plain dbghelp query for addresses outside the known modules.
+    base.unwrap_or_else(|| unsafe { SymGetModuleBase64(process, pc) })
+}
+
+fn walk(process: HANDLE, thread: HANDLE, ctx: &mut Ctx, out: &mut Vec<u64>) {
+    out.clear();
+    PAGES.with_borrow_mut(|c| c.walk.clear());
     // SAFETY: the thread is suspended; the context is 16-byte aligned.
     unsafe {
-        let mut ctx: Box<Ctx> = Box::new(std::mem::zeroed());
+        ctx.0 = std::mem::zeroed();
         ctx.0.ContextFlags = CONTEXT_FULL;
         if GetThreadContext(thread, &mut ctx.0) == 0 {
-            return Vec::new();
+            return;
         }
         let mut frame: STACKFRAME64 = std::mem::zeroed();
         frame.AddrPC.Offset = ctx.0.Rip;
@@ -282,7 +392,6 @@ fn walk(process: HANDLE, thread: HANDLE) -> Vec<u64> {
         frame.AddrFrame.Mode = AddrModeFlat;
         frame.AddrStack.Offset = ctx.0.Rsp;
         frame.AddrStack.Mode = AddrModeFlat;
-        let mut out = Vec::with_capacity(MAX_FRAMES);
         while out.len() < MAX_FRAMES {
             if StackWalk64(
                 IMAGE_FILE_MACHINE_AMD64,
@@ -290,9 +399,9 @@ fn walk(process: HANDLE, thread: HANDLE) -> Vec<u64> {
                 thread,
                 &mut frame,
                 (&mut ctx.0 as *mut CONTEXT).cast(),
-                None,
-                Some(SymFunctionTableAccess64),
-                Some(SymGetModuleBase64),
+                Some(read_memory),
+                Some(function_table),
+                Some(module_base),
                 None,
             ) == 0
                 || frame.AddrPC.Offset == 0
@@ -301,51 +410,239 @@ fn walk(process: HANDLE, thread: HANDLE) -> Vec<u64> {
             }
             out.push(frame.AddrPC.Offset);
         }
-        out
     }
-}
-
-fn top(map: &HashMap<String, u64>, n: usize) -> Vec<(&String, &u64)> {
-    let mut v: Vec<_> = map.iter().collect();
-    v.sort_by(|a, b| b.1.cmp(a.1));
-    v.truncate(n);
-    v
 }
 
 /// `--resolve <image> <offset>...`: names offsets of an image file with its
 /// PDB, loaded into this process (for addresses the live attach left bare).
 fn resolve_offline(rest: &[String]) {
-    use windows_sys::Win32::System::Diagnostics::Debug::{SymLoadModuleExW, SymGetLineFromAddrW64, IMAGEHLP_LINEW64};
-    let image = &rest[0];
+    use windows_sys::Win32::System::Diagnostics::Debug::{IMAGEHLP_LINEW64, SymGetLineFromAddrW64};
+    let Some(image) = rest.first() else { usage_exit(2) };
     let w: Vec<u16> = image.encode_utf16().chain([0]).collect();
     let me = 0x1234usize as HANDLE;
     unsafe {
         SymSetOptions(0x2 | 0x10 | 0x200 | 0x80000); // undname, load lines, fail critical, no prompts
-        if SymInitializeW(me, std::ptr::null(), FALSE) == 0 { eprintln!("SymInitialize failed"); return; }
+        if SymInitializeW(me, std::ptr::null(), FALSE) == 0 {
+            eprintln!("SymInitialize failed");
+            return;
+        }
         let base = 0x1_4000_0000u64;
         let got = SymLoadModuleExW(me, std::ptr::null_mut(), w.as_ptr(), std::ptr::null(), base, 0, std::ptr::null(), 0);
-        if got == 0 { eprintln!("could not load {image}: {}", std::io::Error::last_os_error()); return; }
-        let syms = Symbols { process: me, cache: HashMap::new(), modules: Vec::new() };
+        if got == 0 {
+            eprintln!("could not load {image}: {}", std::io::Error::last_os_error());
+            return;
+        }
+        let syms = Symbols { process: me, modules: Vec::new() };
         for o in &rest[1..] {
             let off = u64::from_str_radix(o.trim_start_matches("0x"), 16).unwrap_or(0);
             let mut line: IMAGEHLP_LINEW64 = std::mem::zeroed();
             line.SizeOfStruct = size_of::<IMAGEHLP_LINEW64>() as u32;
             let mut d = 0u32;
             let at = if SymGetLineFromAddrW64(me, got + off, &mut d, &mut line) != 0 {
-                let mut n = 0; while *line.FileName.add(n) != 0 { n += 1; }
+                let mut n = 0;
+                while *line.FileName.add(n) != 0 {
+                    n += 1;
+                }
                 format!("  {}:{}", String::from_utf16_lossy(std::slice::from_raw_parts(line.FileName, n)), line.LineNumber)
-            } else { String::new() };
+            } else {
+                String::new()
+            };
             println!("{o}  {}{at}", syms.resolve(got + off));
         }
     }
 }
+
+/// This thread's CPU time in cycles (exact, unlike GetProcessTimes, which
+/// charges whole clock ticks and misses a thread that wakes, works and
+/// sleeps between two ticks — the sampler's pattern).
+fn own_cycles() -> u64 {
+    use windows_sys::Win32::System::Threading::GetCurrentThread;
+    use windows_sys::Win32::System::WindowsProgramming::QueryThreadCycleTime;
+    let mut c = 0u64;
+    // SAFETY: the pseudo-handle of this thread.
+    unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut c) };
+    c
+}
+
+/// Cycles per second of the cycle counter, from a short busy spin.
+fn cycles_per_second() -> f64 {
+    let (t, c) = (Instant::now(), own_cycles());
+    while t.elapsed() < Duration::from_millis(30) {
+        std::hint::spin_loop();
+    }
+    (own_cycles() - c) as f64 / t.elapsed().as_secs_f64()
+}
+
+/// A thread of the target while sampling: its handle (null once gone) and
+/// its stacks as raw addresses, leaf first.
+struct Live {
+    h: HANDLE,
+    group: String,
+    described: bool,
+    stacks: HashMap<Vec<u64>, u64>,
+    /// The last stack walked and the thread's cycle count after it.
+    last: Vec<u64>,
+    cycles: u64,
+    /// Walked last round: the suspension's own tail (the thread finishing
+    /// the suspend APC after ResumeThread, a few thousand cycles) may follow.
+    walked: bool,
+}
+
+/// What sampling took, to say how much it disturbs the target.
+#[derive(Default)]
+struct Cost {
+    rounds: u64,
+    /// The sampler's CPU time, s.
+    cpu_s: f64,
+    /// The first round, s (loads unwind data and symbols; not in `cpu_s`).
+    first_s: f64,
+    /// Wall time spent sampling (not sleeping), s.
+    busy_s: f64,
+    /// Target threads' time suspended, summed, s, and the walks.
+    stall_s: f64,
+    walks: u64,
+    /// Samples of threads that had not run since their last one.
+    reused: u64,
+}
+
+fn sample(pid: u32, process: HANDLE, seconds: f64, hz: f64) -> (HashMap<u32, Live>, Cost) {
+    let mut live: HashMap<u32, Live> = HashMap::new();
+    let mut tids: Vec<u32> = Vec::new();
+    let period = Duration::from_secs_f64(1.0 / hz.max(1.0));
+    let rate = cycles_per_second();
+    let start = Instant::now();
+    let end = start + Duration::from_secs_f64(seconds);
+    let mut next = start;
+    let mut last_list = start - Duration::from_secs(10);
+    // SAFETY: a plain C struct, zeroed.
+    let mut ctx: Box<Ctx> = Box::new(unsafe { std::mem::zeroed() });
+    let mut stack = Vec::with_capacity(MAX_FRAMES);
+    let mut cost = Cost::default();
+    let mut stall = Duration::ZERO;
+    let mut busy = Duration::ZERO;
+    let mut cycles0 = own_cycles();
+    while Instant::now() < end {
+        let t0 = Instant::now();
+        if last_list.elapsed() > Duration::from_secs(1) {
+            let now = threads(pid);
+            for (tid, l) in live.iter_mut() {
+                if !l.h.is_null() && !now.contains(tid) {
+                    // SAFETY: our handle, closed once.
+                    unsafe { CloseHandle(l.h) };
+                    l.h = std::ptr::null_mut();
+                }
+            }
+            for &tid in &now {
+                if live.contains_key(&tid) {
+                    continue;
+                }
+                // SAFETY: a handle to a thread of the target, kept until it exits.
+                let h = unsafe {
+                    OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid)
+                };
+                if h.is_null() {
+                    continue;
+                }
+                let d = thread_description(h);
+                live.insert(
+                    tid,
+                    Live { h, described: d.is_some(), group: d.unwrap_or_else(|| format!("(unnamed {tid})")), stacks: HashMap::new(), last: Vec::new(), cycles: 0, walked: false },
+                );
+            }
+            tids = now.into_iter().filter(|t| live.contains_key(t)).collect();
+            last_list = Instant::now();
+        }
+        for tid in &tids {
+            let Some(l) = live.get_mut(tid) else { continue };
+            if l.h.is_null() {
+                continue;
+            }
+            // A thread that has not run a cycle since its last sample still
+            // has that stack: counted again without suspending it.
+            let mut cycles = 0u64;
+            // SAFETY: our handle has THREAD_QUERY_LIMITED_INFORMATION.
+            let have = unsafe { QueryThreadCycleTime(l.h, &mut cycles) } != 0;
+            let slack = if l.walked { APC_TAIL } else { 0 };
+            if have && cycles.wrapping_sub(l.cycles) <= slack && !l.last.is_empty() {
+                l.cycles = cycles;
+                l.walked = false;
+                cost.reused += 1;
+                if let Some(n) = l.stacks.get_mut(l.last.as_slice()) {
+                    *n += 1;
+                }
+                continue;
+            }
+            let s0 = Instant::now();
+            // SAFETY: a thread of the target, suspended only while walked.
+            unsafe {
+                if SuspendThread(l.h) == u32::MAX {
+                    continue;
+                }
+                walk(process, l.h, &mut ctx, &mut stack);
+                ResumeThread(l.h);
+            }
+            stall += s0.elapsed();
+            cost.walks += 1;
+            l.last.clear();
+            if !stack.is_empty() {
+                match l.stacks.get_mut(stack.as_slice()) {
+                    Some(n) => *n += 1,
+                    None => {
+                        l.stacks.insert(stack.clone(), 1);
+                    }
+                }
+                // Read after the walk: cycles the walk's suspension caused
+                // (none run in the thread's own code) don't count as running.
+                l.last.extend_from_slice(&stack);
+                // SAFETY: as above.
+                if unsafe { QueryThreadCycleTime(l.h, &mut cycles) } != 0 {
+                    l.cycles = cycles;
+                    l.walked = true;
+                } else {
+                    l.last.clear();
+                }
+            }
+        }
+        cost.rounds += 1;
+        busy += t0.elapsed();
+        if cost.rounds == 1 {
+            // The first round loads the modules' unwind data and symbols:
+            // a one-time cost, kept apart from the steady cost.
+            cost.first_s = t0.elapsed().as_secs_f64();
+            cycles0 = own_cycles();
+            busy = Duration::ZERO;
+        }
+        // Rounds on a fixed grid; a late round does not push the rest back.
+        next += period;
+        let now = Instant::now();
+        if next > now {
+            std::thread::sleep(next - now);
+        } else if now - next > period * 4 {
+            next = now;
+        }
+    }
+    cost.cpu_s = (own_cycles() - cycles0) as f64 / rate.max(1.0);
+    cost.busy_s = busy.as_secs_f64();
+    cost.stall_s = stall.as_secs_f64();
+    for l in live.values() {
+        if !l.h.is_null() {
+            // SAFETY: our handle.
+            unsafe { CloseHandle(l.h) };
+        }
+    }
+    (live, cost)
+}
+
 
 fn main() {
     let all: Vec<String> = std::env::args().skip(1).collect();
     if all.first().map(String::as_str) == Some("--resolve") {
         return resolve_offline(&all[1..]);
     }
-    let a = args();
+    if all.first().map(String::as_str) == Some("diff") {
+        std::process::exit(diff::run(&all[1..]));
+    }
+    let a = args(&all);
     let pid = a.pid.or_else(|| find_pid(&a.name)).unwrap_or_else(|| {
         eprintln!("no process {}", a.name);
         std::process::exit(1)
@@ -356,6 +653,7 @@ fn main() {
         eprintln!("cannot open process {pid}");
         std::process::exit(1);
     }
+    let mods = modules(pid);
     unsafe {
         const SYMOPT_UNDNAME: u32 = 0x2;
         const SYMOPT_DEFERRED_LOADS: u32 = 0x4;
@@ -365,161 +663,93 @@ fn main() {
         if SymInitializeW(process, std::ptr::null(), FALSE) == 0 {
             eprintln!("dbghelp could not attach (symbols will be module+offset)");
         }
-        // Each module loaded by its file, so its PDB beside it is found.
-        for (base, end, path) in module_paths(pid) {
+        // Each module loaded by its file, so its PDB beside it is found (the
+        // stack walk needs their unwind data).
+        for (base, end, _, path) in &mods {
             let w: Vec<u16> = path.encode_utf16().chain([0]).collect();
-            windows_sys::Win32::System::Diagnostics::Debug::SymLoadModuleExW(
-                process, std::ptr::null_mut(), w.as_ptr(), std::ptr::null(), base, (end - base) as u32, std::ptr::null(), 0,
-            );
+            SymLoadModuleExW(process, std::ptr::null_mut(), w.as_ptr(), std::ptr::null(), *base, (end - base) as u32, std::ptr::null(), 0);
         }
-        let _ = SymRefreshModuleList;
     }
+    PAGES.with_borrow_mut(|c| c.images = mods.iter().map(|(b, e, _, _)| (*b, *e)).collect());
+    eprintln!("sampling pid {pid} for {} s at {} Hz…", a.seconds, a.hz);
+    let (live, cost) = sample(pid, process, a.seconds, a.hz);
+
     // Names from a session of their own with every module loaded by its file
     // at its base, not deferred (the live session left our PDB unread).
     let names_handle = 0x5678usize as HANDLE;
+    let mods = modules(pid).into_iter().chain(mods).collect::<Vec<_>>();
     unsafe {
         SymSetOptions(0x2 | 0x200 | 0x80000);
         SymInitializeW(names_handle, std::ptr::null(), FALSE);
-        for (base, end, path) in module_paths(pid) {
-            let w: Vec<u16> = path.encode_utf16().chain([0]).collect();
-            windows_sys::Win32::System::Diagnostics::Debug::SymLoadModuleExW(
-                names_handle, std::ptr::null_mut(), w.as_ptr(), std::ptr::null(), base, (end - base) as u32, std::ptr::null(), 0,
-            );
-        }
-    }
-    let mut syms = Symbols { process: names_handle, cache: HashMap::new(), modules: modules(pid) };
-    let mut focus: (u64, HashMap<String, u64>, HashMap<String, u64>) = (0, HashMap::new(), HashMap::new());
-    let mut stats: HashMap<String, Stats> = HashMap::new();
-    let mut names: HashMap<u32, String> = HashMap::new();
-    let period = Duration::from_secs_f64(1.0 / a.hz.max(1.0));
-    let end = Instant::now() + Duration::from_secs_f64(a.seconds);
-    let mut rounds = 0u64;
-    let mut last_list = Instant::now() - Duration::from_secs(10);
-    let mut tids = Vec::new();
-    eprintln!("sampling pid {pid} for {} s at {} Hz…", a.seconds, a.hz);
-    while Instant::now() < end {
-        let t0 = Instant::now();
-        if last_list.elapsed() > Duration::from_secs(1) {
-            tids = threads(pid);
-            last_list = Instant::now();
-        }
-        for &tid in &tids {
-            // SAFETY: a thread of the target, suspended only while walked.
-            unsafe {
-                let h = OpenThread(
-                    THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION,
-                    FALSE,
-                    tid,
-                );
-                if h.is_null() {
-                    continue;
-                }
-                let name = names.entry(tid).or_insert_with(|| thread_name(h, tid)).clone();
-                if SuspendThread(h) == u32::MAX {
-                    CloseHandle(h);
-                    continue;
-                }
-                let stack = walk(process, h);
-                ResumeThread(h);
-                CloseHandle(h);
-                if stack.is_empty() {
-                    continue;
-                }
-                let frames: Vec<String> = stack.iter().map(|&p| syms.name(p)).collect();
-                if let Some(f) = &a.focus
-                    && let Some(i) = frames.iter().rposition(|x| x.contains(f.as_str()))
-                {
-                    focus.0 += 1;
-                    let below = if i > 0 { frames[i - 1].clone() } else { "(itself)".into() };
-                    *focus.1.entry(below).or_default() += 1;
-                    let leaf = if is_wait(&frames[0]) { format!("[wait] {}", frames.iter().find(|x| !is_wait(x)).cloned().unwrap_or_default()) } else { frames[0].clone() };
-                    *focus.2.entry(leaf).or_default() += 1;
-                }
-                let s = stats.entry(name).or_default();
-                s.samples += 1;
-                *s.leaf.entry(frames[0].clone()).or_default() += 1;
-                let first_ours = frames.iter().position(|f| !is_wait(f)).unwrap_or(0);
-                if first_ours > 0 {
-                    s.waiting += 1;
-                }
-                let what = if first_ours > 0 {
-                    format!("[wait] {}", frames[first_ours])
-                } else {
-                    frames[0].clone()
-                };
-                *s.what.entry(what.clone()).or_default() += 1;
-                let chain: Vec<&str> = frames[first_ours..].iter().take(5).map(String::as_str).collect();
-                *s.chains.entry(format!("{}{}", if first_ours > 0 { "[wait] " } else { "" }, chain.join("  <-  "))).or_default() += 1;
-                let mut seen = std::collections::HashSet::new();
-                for f in &frames {
-                    if seen.insert(f) {
-                        *s.inclusive.entry(f.clone()).or_default() += 1;
-                    }
-                }
+        let mut loaded = std::collections::HashSet::new();
+        for (base, end, _, path) in &mods {
+            if loaded.insert(*base) {
+                let w: Vec<u16> = path.encode_utf16().chain([0]).collect();
+                SymLoadModuleExW(names_handle, std::ptr::null_mut(), w.as_ptr(), std::ptr::null(), *base, (end - base) as u32, std::ptr::null(), 0);
             }
         }
-        rounds += 1;
-        if let Some(rest) = period.checked_sub(t0.elapsed()) {
-            std::thread::sleep(rest);
-        }
     }
-    // Report.
-    let mut r = String::new();
-    use std::fmt::Write;
-    let secs = a.seconds;
-    let _ = writeln!(r, "kitty6-prof: pid {pid}, {rounds} rounds in {secs} s ({:.0} Hz achieved)\n", rounds as f64 / secs);
-    let mut kinds: Vec<_> = stats.iter().collect();
-    // Busiest first: samples not waiting.
-    kinds.sort_by(|a, b| (b.1.samples - b.1.waiting).cmp(&(a.1.samples - a.1.waiting)));
-    let _ = writeln!(r, "== threads (running share = samples not in a wait primitive)");
-    for (name, s) in &kinds {
-        let _ = writeln!(r, "  {:<40} {:>6} samples  running {:>5.1}%", name, s.samples, 100.0 * (s.samples - s.waiting) as f64 / s.samples.max(1) as f64);
+    let syms = Symbols { process: names_handle, modules: mods.iter().map(|(b, e, n, _)| (*b, *e, n.clone())).collect() };
+    let mut by_addr: HashMap<u64, u32> = HashMap::new();
+    let mut by_name: HashMap<String, u32> = HashMap::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut threads: Vec<ThreadData> = Vec::new();
+    let mut tids: Vec<_> = live.into_iter().collect();
+    tids.sort_by_key(|(t, _)| *t);
+    for (tid, l) in tids {
+        let mut merged: HashMap<Vec<u32>, u64> = HashMap::new();
+        for (stack, n) in l.stacks {
+            let ids: Vec<u32> = stack
+                .iter()
+                .map(|&p| {
+                    *by_addr.entry(p).or_insert_with(|| {
+                        let s = syms.resolve(p);
+                        *by_name.entry(s.clone()).or_insert_with(|| {
+                            names.push(s);
+                            (names.len() - 1) as u32
+                        })
+                    })
+                })
+                .collect();
+            *merged.entry(ids).or_default() += n;
+        }
+        if merged.is_empty() {
+            continue;
+        }
+        threads.push(ThreadData { tid, group: l.group, described: l.described, stacks: merged.into_iter().collect() });
     }
-    let mut all = Stats::default();
-    for (_, s) in &kinds {
-        for (k, v) in &s.what {
-            *all.what.entry(k.clone()).or_default() += v;
-        }
-        for (k, v) in &s.inclusive {
-            *all.inclusive.entry(k.clone()).or_default() += v;
-        }
-        all.samples += s.samples;
-    }
-    let _ = writeln!(r, "\n== all threads: what they run or wait in (first frame of ours)");
-    for (k, v) in top(&all.what, a.top) {
-        let _ = writeln!(r, "  {:>6.1}%  {k}", 100.0 * *v as f64 / all.samples.max(1) as f64);
-    }
-    for (name, s) in kinds.iter().take(12) {
-        let _ = writeln!(r, "\n== {name} ({} samples, running {:.1}%)", s.samples, 100.0 * (s.samples - s.waiting) as f64 / s.samples.max(1) as f64);
-        let _ = writeln!(r, "  -- what (first frame of ours):");
-        for (k, v) in top(&s.what, 10) {
-            let _ = writeln!(r, "    {:>6.1}%  {k}", 100.0 * *v as f64 / s.samples.max(1) as f64);
-        }
-        let _ = writeln!(r, "  -- chains:");
-        for (k, v) in top(&s.chains, 8) {
-            let _ = writeln!(r, "    {:>6.1}%  {k}", 100.0 * *v as f64 / s.samples.max(1) as f64);
-        }
-        let _ = writeln!(r, "  -- inclusive:");
-        for (k, v) in top(&s.inclusive, 12) {
-            let _ = writeln!(r, "    {:>6.1}%  {k}", 100.0 * *v as f64 / s.samples.max(1) as f64);
-        }
-    }
-    if let Some(f) = &a.focus {
-        let _ = writeln!(r, "
-== focus: {f} ({} samples under it, {:.1} threads busy in it on average)", focus.0, focus.0 as f64 / rounds.max(1) as f64);
-        let _ = writeln!(r, "  -- what it calls (frame just below it):");
-        for (k, v) in top(&focus.1, 25) {
-            let _ = writeln!(r, "    {:>6.1}%  {k}", 100.0 * *v as f64 / focus.0.max(1) as f64);
-        }
-        let _ = writeln!(r, "  -- leaves under it:");
-        for (k, v) in top(&focus.2, 25) {
-            let _ = writeln!(r, "    {:>6.1}%  {k}", 100.0 * *v as f64 / focus.0.max(1) as f64);
-        }
-    }
+    let profile = Profile {
+        pid,
+        seconds: a.seconds,
+        hz: a.hz,
+        rounds: cost.rounds,
+        names,
+        threads,
+        sampler_cpu_s: cost.cpu_s,
+        sampler_busy_s: cost.busy_s,
+        sampler_first_s: cost.first_s,
+        stall_s: cost.stall_s,
+        walks: cost.walks,
+        exe: mods.first().map(|m| m.2.clone()).unwrap_or_default(),
+        reused: cost.reused,
+    };
+    let an = analysis::analyze(&profile, &a.opts);
+    let r = analysis::report(&profile, &an, &a.opts);
     print!("{r}");
-    if let Some(out) = a.out {
-        let _ = std::fs::write(&out, &r);
-        eprintln!("written to {out}");
+    let write = |path: &Option<String>, text: &str| {
+        if let Some(path) = path {
+            match std::fs::write(path, text) {
+                Ok(()) => eprintln!("written to {path}"),
+                Err(e) => eprintln!("cannot write {path}: {e}"),
+            }
+        }
+    };
+    write(&a.out, &r);
+    if a.json.is_some() {
+        write(&a.json, &analysis::to_json(&profile, &an));
+    }
+    if a.folded.is_some() {
+        write(&a.folded, &analysis::folded(&profile, &an, &a.opts));
     }
     unsafe { CloseHandle(process) };
 }
