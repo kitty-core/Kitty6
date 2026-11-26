@@ -34,6 +34,16 @@ by the project owner's decision (2026-11-23), entered as an exception in
 repository's licence does not cover them. Nothing else of this kind is
 accepted.
 
+## Kitty6's media exception
+
+By the Kitty6 owner's decision (2026-11-26): small, downscaled pictures of
+what the runtime draws, cropped to show a known bug or a tool of ours
+(the dev menu, the panel, the overlay), may go in `docs/media/` as PNG or
+JPEG, at most 300 KB each (checked in `xtask/src/policy.rs`). They document
+our bugs and tools; they are not assets. Never full-resolution captures,
+never textures, models or anything extracted from the title's files, and
+anything is taken down on request.
+
 ## Where data lives
 
 Outside the repository, configured in `victory.toml`: `game_dir` (the
