@@ -307,17 +307,23 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 /// (`VICTORY_RT_MISS=1`) and the structure builder off, nothing reads what
 /// they write, and they were the largest share of the card's time in a
 /// cutscene (~6 ms a dispatch, hundreds a frame).
+///
+/// The container holds its entry point's name, not the effect's: all 30
+/// entry points named `CSComputeSkinning*` in the title's shader file are
+/// `bvh_skinning`'s; the picture's own skinning is `CS_PedStandardSkinning*`,
+/// `CS_PosOnlyLodSkinning*` and the cloth's `computeclothSkinning`.
 #[cfg(windows)]
 fn skins_for_rays(bytes: &[u8]) -> bool {
-    const NAME: &[u8] = b"bvh_skinningCS";
+    const NAME: &[u8] = b"CSComputeSkinning";
     bytes.windows(NAME.len()).any(|w| w == NAME)
 }
 
 #[cfg(all(test, windows))]
 #[test]
 fn ray_skinning_programs_are_known_by_name() {
-    assert!(skins_for_rays(b"..\0bvh_skinningCSComputeSkinningRigidVelocity_1c34db0a_Wrapped\0.."));
-    assert!(!skins_for_rays(b"PS_PedSkin_0001"));
+    assert!(skins_for_rays(b"..\0CSComputeSkinningRigidVelocity_1c34db0a_Wrapped\0.."));
+    assert!(!skins_for_rays(b"..\0CS_PedStandardSkinning_3_00aa11bb_Wrapped\0.."));
+    assert!(!skins_for_rays(b"computeclothSkinning"));
 }
 
 /// Whether a dispatch of `this` is left out because it only feeds the
