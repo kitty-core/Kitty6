@@ -58,7 +58,7 @@ sampling:
   --name EXE       process name (default victory.exe)
   --seconds S      how long to sample (default 20)
   --hz H           samples per thread per second (default 100; 50 is plenty
-                   for a 20 s run and halves the sampler's cost)
+                   for a 20 s run and costs the sampler less CPU)
 report:
   --top N          rows in the all-threads tables (default 25)
   --out FILE       also write the text report to FILE
@@ -78,11 +78,19 @@ diff: two --json runs side by side, per role (and all threads): busy and
 waiting ms/s by kind, then the wait sites, busy-self and inclusive functions
 whose time changed most, in ms/s and percentage points of the role's samples.
 
-The report shows per thread: running share, waits by site (the first frame of
-ours above the wait primitive, with the wait kind: lock / event / fence /
-sleep / idle / message), what it runs, call chains and inclusive functions.
-Wait times are thread-ms per second of wall time (a thread waiting the whole
-time is 1000 ms/s) and % of that thread's samples.
+The report shows the sampler's own cost, then per thread: running share,
+waiting split by kind; per role (submission, list recorders, pools, title
+threads, ... from the thread description or entry function): busy and
+waiting %, top self and inclusive functions, waits by site; waits by site over
+all threads (the first frame of ours above the wait primitive, with the kind:
+lock / event / fence / sleep / idle / message); per thread what it runs, call
+chains and inclusive functions. Times are thread-ms per second of wall time
+(a thread waiting the whole time is 1000 ms/s) and % of the samples.
+
+A/B: run with --json a.json, change the build or a switch, run with
+--json b.json, then `kitty6-prof diff a.json b.json`. Flame graph:
+python tools/charts/flame.py prof.folded prof.svg [--per-role DIR].
+See docs/profiling.md.
 ";
 
 #[repr(C, align(16))]

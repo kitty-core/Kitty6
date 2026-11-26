@@ -117,8 +117,11 @@ More on running, the commands and every switch: [docs/README-7900XTX.md](docs/RE
 ## Tools made here
 
 - `tools/kitty6-prof`: samples every thread's stack of the running process, with
-  names from the PDB: per thread what it runs or waits in, call chains, and
-  `--focus` for what runs under one function.
+  names from the PDB: per thread and per role (submission, list recorders,
+  pools, title threads) what it runs, what it waits on (lock, event, card
+  fence, sleep) and from where, call chains, `--focus` for what runs under one
+  function; `--json` / `--folded` output, `diff` of two runs and flame graphs
+  (`tools/charts/flame.py`). See [docs/profiling.md](docs/profiling.md).
 - `apps/kitty6-overlay`: live graphs of the run in a window beside the game.
 - **Renderer mods** (`mods/*.k6mod`, `crates/victory-gpu/src/kitty6.rs`): rule files
   of our own that skip a translated shader's draws or run them every n-th frame,

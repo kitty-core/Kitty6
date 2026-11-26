@@ -15,6 +15,9 @@ target\diag\victory.exe probe-report <probe file>            # what it says
 target\diag\victory.exe probe-report <before> <after>        # the second against the first
 ```
 
+Where the threads' time goes within a run (waits by site, thread roles,
+an A/B diff of two builds, flame graphs): [profiling.md](profiling.md).
+
 The folder must be outside the source tree. `VICTORY_PROBE_STALL_MS` (100) sets
 the frame time from which a frame is a stall.
 
