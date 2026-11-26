@@ -9,6 +9,31 @@ Figures come from scripted runs on one PC (RTX 4070 12 GB, 32 GB RAM, Windows 11
 23H2, Series S profile, opening scene): each is the run's median over its last
 45 s in the world, from the run probes.
 
+## 2026-11-26 (late)
+
+**The "regression" wasn't one.** The build from before today's ports, run
+again under the same conditions, gets the same 16.7 fps with 25.2 ms of GPU
+wait as the current code. The ~20 fps runs were taken under different
+conditions. Today's slower runs had other work on the card (shader tests) and
+the PC locked. From now on every comparison runs a reference build in the same
+session.
+
+- Ruled out as causes: 4 KiB texture placements, the saveexec and fmac fixes,
+  the 16-bit halves commits, the light stand-in's strength.
+- Merged on `dev`:
+  - mimalloc allocator (trustno1 PR #11)
+  - joined compares of neighbouring copy ranges (VI-BR-PORT 2f59f1dfd8,
+    `VICTORY_CARD_COMPARE_JOIN`)
+  - an off switch for half views (klbf-lab PR #113, `VICTORY_HALF_VIEWS=0`)
+    and for integer format loads (`K6_HALF_LOADS=0`)
+  - an `-Rtx4070` launcher preset (after Vice-Tay PR #69)
+- Release builds compile again (the renderer mods used a diagnostics-only
+  counter).
+- New Kitty6 switches are named `K6_...` from now on.
+- **Next:** a GPU timing run to rank shaders by milliseconds, then cut the
+  costly passes; upstream's port-2 fallback budget (4aeb6d08, reported 15-25
+  ms a frame); render scale.
+
 ## 2026-11-26 (evening)
 
 **Where it stands:** about 17 fps on `dev`, down from about 20 before two port
