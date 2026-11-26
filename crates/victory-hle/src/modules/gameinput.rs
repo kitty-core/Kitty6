@@ -1218,6 +1218,8 @@ mod host {
                 // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
                     .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
+                    // (The dev menu's keys: `victory_gpu::devmenu`.)
+                    .filter(|&vk| !kept_from_title(vk))
                     // SAFETY: plain queries.
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
@@ -1285,10 +1287,28 @@ mod host {
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut down: Vec<u8> = keys.iter()
             .filter(|&&(from, to, _)| (from..to).contains(&now))
             .map(|&(_, _, vk)| vk)
-            .collect()
+            .collect();
+        // The dev menu's autopilot.
+        for vk in victory_gpu::devmenu::held_keys() {
+            if !down.contains(&vk) {
+                down.push(vk);
+            }
+        }
+        down
+    }
+
+    /// A key the dev menu keeps from the title.
+    #[cfg(feature = "diagnostics")]
+    fn kept_from_title(vk: u8) -> bool {
+        victory_gpu::devmenu::kept_from_title(vk)
+    }
+
+    #[cfg(not(feature = "diagnostics"))]
+    fn kept_from_title(_vk: u8) -> bool {
+        false
     }
 
     /// The foreground window is one of ours (the title's or our fallback).

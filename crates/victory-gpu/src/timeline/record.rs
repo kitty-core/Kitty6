@@ -506,6 +506,11 @@ fn asked() -> Option<&'static Asked> {
         .as_ref()
 }
 
+/// Whether timelines are recorded on demand (`VICTORY_TIMELINE=key,..`).
+pub(crate) fn keyed() -> bool {
+    asked().is_some_and(|a| a.on_key)
+}
+
 /// Whether a timeline was asked for.
 pub(super) fn wanted() -> bool {
     asked().is_some()
@@ -538,7 +543,7 @@ pub(crate) fn presented() {
     let mut stage = STAGE.lock().unwrap_or_else(|e| e.into_inner());
     let after = if asked.on_key {
         // Pressed while one is under way or being written: not counted.
-        let pressed = f8_pressed();
+        let pressed = f8_pressed() | crate::devmenu::take_timeline();
         if stage.writing || (!stage.ready && !pressed) {
             return;
         }

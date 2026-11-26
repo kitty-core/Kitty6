@@ -25,6 +25,8 @@ mod texlate;
 mod texstore;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub mod devmenu;
 #[cfg(windows)]
 mod compose;
 pub mod console;

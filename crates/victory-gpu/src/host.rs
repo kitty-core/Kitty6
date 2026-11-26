@@ -9830,8 +9830,11 @@ impl Host {
             // Sent ahead ([`late_free_present`]) unless the frame is to be
             // read back at once (a saved or listed frame): then a list of
             // its own, one whose last flight has finished or a new one.
+            // A frame of footage or a shot of the dev menu's (`crate::devmenu`).
             #[cfg(feature = "diagnostics")]
-            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
+            let footage = crate::devmenu::frame_wanted(frame);
+            #[cfg(feature = "diagnostics")]
+            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame) || footage;
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
             let slot = if late_free_present() && !read_now {
@@ -9944,6 +9947,16 @@ impl Host {
                     }
                 })
                 .flatten();
+            // (The swap chain's buffer, as shown: it holds the picture either way.)
+            #[cfg(feature = "diagnostics")]
+            let footage = footage
+                .then(|| {
+                    list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    let res = crate::capture::read_back(&self.device, list, &back);
+                    list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                    res
+                })
+                .flatten();
             #[cfg(feature = "diagnostics")]
             let probe = if slot.is_some() || composed {
                 None
@@ -9999,6 +10012,10 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
+            }
+            #[cfg(feature = "diagnostics")]
+            if let Some((buffer, footprint)) = footage {
+                crate::devmenu::save(frame, &buffer, &footprint);
             }
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);

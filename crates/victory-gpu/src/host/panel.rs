@@ -27,7 +27,7 @@ const GLYPH: (u32, u32) = (5, 7);
 const CELL: (u32, u32) = (6, 9);
 /// Characters in a line, lines, and the box's rim in dots.
 const COLUMNS: u32 = 40;
-const LINES: u32 = 9;
+const LINES: u32 = 21;
 const RIM: u32 = 3;
 
 /// The texts are put into one of these in turn: the card reads the others,
@@ -102,6 +102,8 @@ const fn glyph(c: u8) -> [u8; 7] {
         b'.' => [0, 0, 0, 0, 0, 0b01100, 0b01100],
         b'/' => [0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000],
         b'-' => [0, 0, 0, 0b11111, 0, 0, 0],
+        b':' => [0, 0b01100, 0b01100, 0, 0b01100, 0b01100, 0],
+        b'>' => [0b01000, 0b00100, 0b00010, 0b00001, 0b00010, 0b00100, 0b01000],
         b' ' => [0; 7],
         _ => [0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111],
     }
@@ -291,6 +293,8 @@ pub(super) struct Panel {
     cost: Duration,
     before: Counters,
     lines: Vec<String>,
+    /// The numbers' lines, without the dev menu's.
+    numbers: Vec<String>,
     changed: bool,
     buffers: Option<Buffers>,
     failed: bool,
@@ -307,6 +311,7 @@ impl Panel {
             cost: Duration::ZERO,
             before: Counters::default(),
             lines: Vec::new(),
+            numbers: Vec::new(),
             changed: false,
             buffers: None,
             failed: false,
@@ -316,12 +321,24 @@ impl Panel {
     /// A frame was presented; `line`: the counters go back to 0 right behind
     /// this call. (Not shown it asks for the key's state and no more.)
     pub(super) fn frame(&mut self, line: bool) {
-        if pressed() {
+        crate::devmenu::poll();
+        if pressed() | crate::devmenu::take_panel_toggle() {
             shown().fetch_xor(true, Ordering::Relaxed);
+            self.compose();
+        }
+        if crate::devmenu::take_changed() {
+            self.compose();
+        }
+        if crate::devmenu::take_snapshot() {
+            let numbers = if self.numbers.is_empty() { "(the panel's numbers come once it has been shown a second)".to_owned() } else { self.numbers.join(" | ") };
+            tracing::warn!(at = crate::devmenu::seconds(), "snapshot (dev menu): {numbers}");
         }
         if !shown().load(Ordering::Relaxed) {
             self.frames = 0;
-            return;
+            // (Numbers are made while hidden only for snapshots and the menu.)
+            if !crate::devmenu::open() {
+                return;
+            }
         }
         let now = Instant::now();
         if self.frames == 0 && now - self.last > 2 * EVERY {
@@ -342,10 +359,24 @@ impl Panel {
         let c = counters.since(self.before, frames);
         self.before = counters;
         let cost = self.cost.as_secs_f64() * 1e6 / frames;
-        self.lines = text(&c, elapsed.as_secs_f64() * 1e3 / frames, self.worst, cost, host);
-        self.changed = true;
+        self.numbers = text(&c, elapsed.as_secs_f64() * 1e3 / frames, self.worst, cost, host);
+        self.compose();
         (self.since, self.frames, self.worst) = (now, 0, 0.0);
         self.cost = now.elapsed();
+    }
+
+    /// The box's lines: the numbers if shown, then the dev menu if open.
+    fn compose(&mut self) {
+        let mut lines = if shown().load(Ordering::Relaxed) { self.numbers.clone() } else { Vec::new() };
+        if crate::devmenu::open() {
+            if !lines.is_empty() {
+                lines.push(String::new());
+            }
+            lines.extend(crate::devmenu::lines());
+        }
+        lines.truncate(LINES as usize);
+        self.lines = lines;
+        self.changed = true;
     }
 
     /// Records the copy of the box onto `back`, a buffer of the swap chain of
@@ -358,7 +389,7 @@ impl Panel {
         (width, height): (u32, u32),
         format: DXGI_FORMAT,
     ) {
-        if !shown().load(Ordering::Relaxed) || self.lines.is_empty() || self.failed {
+        if self.lines.is_empty() || self.failed {
             return;
         }
         let began = Instant::now();
@@ -414,7 +445,8 @@ impl Panel {
                 top: 0,
                 front: 0,
                 right: w.min(width),
-                bottom: h.min(height),
+                // (Only the lines there are.)
+                bottom: h.min(height).min((self.lines.len() as u32 * CELL.1 + 2 * RIM) * scale),
                 back: 1,
             };
             list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&part));
@@ -431,7 +463,7 @@ mod tests {
     /// alike.
     #[test]
     fn characters_differ() {
-        let used: Vec<u8> = (b'0'..=b'9').chain(b'A'..=b'Z').chain(*b"./- ").collect();
+        let used: Vec<u8> = (b'0'..=b'9').chain(b'A'..=b'Z').chain(*b"./- :>").collect();
         for (i, a) in used.iter().enumerate() {
             assert_ne!(glyph(*a), glyph(b'#'), "{} has a picture", *a as char);
             assert!(glyph(*a).iter().all(|row| row >> GLYPH.0 == 0));

@@ -20,6 +20,10 @@
 # -Console      X or S: the console profile, whatever -Lean picks (-Lean alone is S). X is the
 #               sharper Series X picture; with -Output 1920x1080 it renders 1080p itself
 # -Output       the title's own output size, e.g. 1920x1080 (Series X profile; VICTORY_OUTPUT)
+# -Dev          dev-menu items at set times, e.g. '200:footage,240:timeline,270:autopilot' (seconds after
+#               the first frame; VICTORY_DEV). In game F4 opens the dev menu: PgUp/PgDn pick, Insert runs.
+#               Items: panel, footage (frames saved as PNG to %LOCALAPPDATA%\victory\footage), rate, shot,
+#               timeline, snapshot (numbers to the log), autopilot (walk/run/circle), mark
 # -Panel        the run's numbers drawn on the picture (F3 hides and shows them), so screenshots carry them
 # -F8Timeline   F8 in the game records a 3-frame timeline (diagnostics build) to logs\f8.f8-<n>.json/.txt:
 #               where the frame's time went, at the moment you press it
@@ -36,6 +40,7 @@ param(
     [switch]$Drive,
     [double]$DriveAt = 200,
     [switch]$Panel,
+    [string]$Dev = '',
     [ValidateSet('', 'X', 'S')][string]$Console = '',
     [string]$Output = '',
     [switch]$F8Timeline,
@@ -84,6 +89,7 @@ if ($Quality) { $settings.VICTORY_TEXTURE_MIP_BIAS = @{ Low = '2'; Medium = '1';
 if ($Fps -eq 0) { $settings.VICTORY_FRAME_INTERVAL_MS = '0' }
 elseif ($Fps -gt 0) { $settings.VICTORY_FRAME_INTERVAL_MS = (1000.0 / $Fps).ToString('0.###', [Globalization.CultureInfo]::InvariantCulture) }
 if ($Panel) { $settings.VICTORY_PANEL = '1' }
+if ($Dev) { $settings.VICTORY_DEV = $Dev }
 if ($Output) { $settings.VICTORY_OUTPUT = $Output }
 if ($F8Timeline) { $settings.VICTORY_TIMELINE = 'key,3,' + (Join-Path $env:LOCALAPPDATA 'victory\logs\f8.json') }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
