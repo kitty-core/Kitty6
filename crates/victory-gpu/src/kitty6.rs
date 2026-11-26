@@ -143,6 +143,7 @@ pub fn on() -> bool {
 }
 
 /// A line for the log: what each rule held back and let run so far.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) fn report() -> String {
     rules()
         .iter()
