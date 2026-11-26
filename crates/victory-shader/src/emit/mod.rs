@@ -516,11 +516,19 @@ pub fn emit(
         };
         // The program in two other forms: without its early-outs, and
         // without any branch that only skips code no lane is left for.
+        // (`VICTORY_WAVE_WHY=1` says why a form that exists is not tried)
+        let failed = |stage: &str, e: ShaderError| {
+            if why {
+                eprintln!("WAVE64-FORM {stage}: {e}");
+            }
+        };
         let form = |p: Option<ir::Program>| {
             p.and_then(|p| {
-                let st = structure::structure(&p).ok()?;
-                let io = io::raise(&p, native).ok()?;
-                let res = resource::track(&p, &native.layout, native.stage, Some(&st)).ok()?;
+                let st = structure::structure(&p).map_err(|e| failed("structure", e)).ok()?;
+                let io = io::raise(&p, native).map_err(|e| failed("io", e)).ok()?;
+                let res = resource::track(&p, &native.layout, native.stage, Some(&st))
+                    .map_err(|e| failed("resource", e))
+                    .ok()?;
                 Some((p, st, io, res))
             })
         };

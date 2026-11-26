@@ -1438,4 +1438,96 @@ fn pair_meetings_only_change_programs_lowered_with_them() {
     let a = lowered(&one, &p1, &wide).expect("lower");
     let b = lower::with_pair_meetings(|| lowered(&one, &p1, &wide)).expect("lower");
     assert_eq!(a.dxil, b.dxil);
+/// DS `op vdst, addr, data0` at byte offset `offset`.
+const fn ds_at(op: u8, vdst: u8, addr: u8, data0: u8, offset: u16) -> [u32; 2] {
+    let [w0, w1] = ds(op, vdst, addr, data0);
+    [w0 | offset as u32, w1]
+}
+
+const DS_ADD_RTN_U32: u8 = 0x20;
+
+/// One console wave of 64 threads with 512 bytes of LDS, which sets dwords 0 and 4 and then
+/// runs `region` in a lane branch on `condition` (VALU code that sets VCC). `v9` holds 0 (the
+/// address), `v2` holds 1. As in [`flag_program`], a scalar exit makes the region blocks of
+/// their own. Every thread stores dword 4 (byte 16) at its own UAV offset afterwards.
+fn region_program(condition: &[u32], region: &[u32]) -> NativeProgram {
+    let mut body = vec![
+        0x7E12_0280, // v_mov_b32 v9, 0
+        0x7E0A_0285, // v_mov_b32 v5, 5
+    ];
+    body.extend_from_slice(&ds(DS_WRITE_B32, 0, 9, 5)); // ds_write_b32 v9, v5
+    body.extend_from_slice(&ds_at(DS_WRITE_B32, 0, 9, 9, 16)); // ds_write_b32 v9, v9 offset:16
+    let mut branch = vec![0x7E04_0281]; // v_mov_b32 v2, 1
+    branch.extend_from_slice(&[
+        0xBF07_8001,                       // s_cmp_lg_u32 s1, 0
+        0xBF85_0000 | region.len() as u32, // s_cbranch_scc1 past the region
+    ]);
+    branch.extend_from_slice(region);
+    body.extend_from_slice(condition);
+    body.extend_from_slice(&[
+        0xBE8C_246A,                       // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000 | branch.len() as u32, // s_cbranch_execz past the branch
+    ]);
+    body.extend_from_slice(&branch);
+    body.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+    body.extend_from_slice(&ds_at(DS_READ_B32, 5, 9, 0, 16)); // ds_read_b32 v5, v9 offset:16
+    body.extend_from_slice(&[
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 5 << 8 | 1, // buffer_store_dword v5, v1, s[8:11], 0 offen
+    ]);
+    let mut native = native(&body);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+    }
+    native
+}
+
+/// `v_cmp_gt_u32 vcc, s0, v0`: the threads below s0.
+const BELOW_S0: [u32; 1] = [0x7D88_0000];
+
+/// Reads the limit in dword 0 and takes a slot from the counter at byte `counter`.
+fn counter_region(counter: u16) -> Vec<u32> {
+    let mut region = ds(DS_READ_B32, 3, 9, 0).to_vec(); // ds_read_b32 v3, v9
+    region.extend_from_slice(&ds_at(DS_ADD_RTN_U32, 4, 9, 2, counter)); // ds_add_rtn_u32 v4, v9, v2
+    region
+}
+
+#[test]
+fn a_branch_whose_lds_reads_and_atomics_never_meet_runs_in_waves_of_32() {
+    // the limit it reads is set before the branch; the slots come from another dword
+    assert_eq!(flag_wave(&region_program(&BELOW_S0, &counter_region(16))), Some(32));
+    // with the counter on the limit itself, a read may miss the other host wave's additions
+    assert_eq!(flag_wave(&region_program(&BELOW_S0, &counter_region(0))), Some(64));
+}
+
+#[test]
+fn two_atomics_on_one_dword_in_a_branch_keep_64_lanes() {
+    // on the console the later atomic's old value counts the earlier one of every lane
+    let mut region = counter_region(16);
+    region.extend_from_slice(&ds_at(DS_ADD_RTN_U32, 6, 9, 2, 16)); // ds_add_rtn_u32 v6, v9, v2 offset:16
+    assert_eq!(flag_wave(&region_program(&BELOW_S0, &region)), Some(64));
+}
+
+/// Reads dword 0, adds one and writes it back: a read and a write of one dword.
+fn bump_region() -> Vec<u32> {
+    let mut region = ds(DS_READ_B32, 3, 9, 0).to_vec(); // ds_read_b32 v3, v9
+    region.push(0x4A06_0681); // v_add_nc_u32 v3, 1, v3
+    region.extend_from_slice(&ds(DS_WRITE_B32, 0, 9, 3)); // ds_write_b32 v9, v3
+    region
+}
+
+#[test]
+fn a_branch_one_lane_of_the_wave_runs_reads_and_writes_lds_in_waves_of_32() {
+    // `v_cmp_eq_u32 vcc, 0, v0`: thread 0 alone
+    assert_eq!(flag_wave(&region_program(&[0x7D84_0080], &bump_region())), Some(32));
+    // `v_add_nc_u32 v7, s2, v0`, `v_cmp_eq_u32 vcc, s3, v7`: one thread, wherever s2 and s3 put it
+    assert_eq!(flag_wave(&region_program(&[0x4A0E_0002, 0x7D84_0E03], &bump_region())), Some(32));
+}
+
+#[test]
+fn a_branch_several_lanes_run_that_reads_and_writes_one_lds_dword_keeps_64_lanes() {
+    assert_eq!(flag_wave(&region_program(&BELOW_S0, &bump_region())), Some(64));
+    // `v_mov_b32 v7, 1`, `v_cmp_eq_u32 vcc, s3, v7`: v7 is alike in every lane: all lanes or none
+    assert_eq!(flag_wave(&region_program(&[0x7E0E_0281, 0x7D84_0E03], &bump_region())), Some(64));
 }
