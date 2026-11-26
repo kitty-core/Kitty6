@@ -33,6 +33,8 @@ pub mod kitty6;
 mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
+mod census;
+#[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 
 /// Release builds with the `mimalloc` feature: the Rust side allocates
