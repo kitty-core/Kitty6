@@ -11,6 +11,7 @@
 //! See `USAGE` below for the options.
 
 mod analysis;
+mod json;
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -60,6 +61,13 @@ report:
   --top N          rows in the all-threads tables (default 25)
   --out FILE       also write the text report to FILE
   --focus NAME     what runs under the frames whose name contains NAME
+  --json FILE      per-thread and per-role samples, busy/wait counts by
+                   kind, self and inclusive counts per function, waits by
+                   site (input of `kitty6-prof diff`)
+  --folded FILE    stacks in the folded format, root first, one line each:
+                   `thread [role];outer;...;leaf count` (samples that wait
+                   end in a `[wait: kind]` frame); tools/charts/flame.py
+                   draws it
   --fence PAT      extra frame-name pattern (repeatable) marking a kernel
                    event wait as a card fence wait (default patterns cover
                    victory_gpu::host/fence/queue and *fence*/*settle*)
@@ -81,6 +89,8 @@ struct Args {
     hz: f64,
     opts: analysis::Options,
     out: Option<String>,
+    json: Option<String>,
+    folded: Option<String>,
 }
 
 fn usage_exit(code: i32) -> ! {
@@ -100,6 +110,8 @@ fn args(list: &[String]) -> Args {
         hz: 100.0,
         opts: analysis::Options::default(),
         out: None,
+        json: None,
+        folded: None,
     };
     let mut it = list.iter().cloned();
     while let Some(k) = it.next() {
@@ -111,6 +123,8 @@ fn args(list: &[String]) -> Args {
             "--hz" => a.hz = v().parse().unwrap_or(100.0),
             "--top" => a.opts.top = v().parse().unwrap_or(25),
             "--out" => a.out = Some(v()),
+            "--json" => a.json = Some(v()),
+            "--folded" => a.folded = Some(v()),
             "--focus" => a.opts.focus = Some(v()),
             "--fence" => a.opts.fence.push(v().to_ascii_lowercase()),
             "--help" | "-h" => usage_exit(0),
@@ -695,9 +709,20 @@ fn main() {
     let an = analysis::analyze(&profile, &a.opts);
     let r = analysis::report(&profile, &an, &a.opts);
     print!("{r}");
-    if let Some(out) = a.out {
-        let _ = std::fs::write(&out, &r);
-        eprintln!("written to {out}");
+    let write = |path: &Option<String>, text: &str| {
+        if let Some(path) = path {
+            match std::fs::write(path, text) {
+                Ok(()) => eprintln!("written to {path}"),
+                Err(e) => eprintln!("cannot write {path}: {e}"),
+            }
+        }
+    };
+    write(&a.out, &r);
+    if a.json.is_some() {
+        write(&a.json, &analysis::to_json(&profile, &an));
+    }
+    if a.folded.is_some() {
+        write(&a.folded, &analysis::folded(&profile, &an, &a.opts));
     }
     unsafe { CloseHandle(process) };
 }

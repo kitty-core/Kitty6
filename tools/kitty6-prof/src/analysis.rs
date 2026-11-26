@@ -14,6 +14,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
+use crate::json::{self, Value};
+
 pub type Map = HashMap<String, u64>;
 
 pub struct ThreadData {
@@ -632,6 +634,109 @@ pub fn report(p: &Profile, a: &Analysis, o: &Options) -> String {
     r
 }
 
+fn map_json(m: &Map) -> Value {
+    let mut v: Vec<_> = m.iter().collect();
+    v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    Value::Obj(v.into_iter().map(|(k, n)| (k.clone(), Value::Num(*n as f64))).collect())
+}
+
+fn waits_json(p: &Profile, s: &Stats) -> Value {
+    let mut v: Vec<_> = s.waits.iter().collect();
+    v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    Value::Arr(
+        v.into_iter()
+            .map(|((site, kind), n)| {
+                Value::Obj(vec![
+                    ("site".into(), Value::Str(site.clone())),
+                    ("kind".into(), Value::Str(kind.name().into())),
+                    ("samples".into(), Value::Num(*n as f64)),
+                    ("ms_per_s".into(), Value::Num(p.ms_per_s(*n))),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn stats_json(p: &Profile, s: &Stats, head: Vec<(String, Value)>) -> Value {
+    let mut o = head;
+    o.push(("samples".into(), Value::Num(s.samples as f64)));
+    o.push(("busy".into(), Value::Num(s.busy as f64)));
+    o.push(("busy_ms_per_s".into(), Value::Num(p.ms_per_s(s.busy))));
+    o.push(("wait".into(), Value::Obj(Kind::ALL.iter().map(|k| (k.name().to_string(), Value::Num(s.wait_kind[*k as usize] as f64))).collect())));
+    o.push(("waits".into(), waits_json(p, s)));
+    o.push(("self".into(), map_json(&s.self_all)));
+    o.push(("self_busy".into(), map_json(&s.self_busy)));
+    o.push(("inclusive".into(), map_json(&s.inclusive)));
+    Value::Obj(o)
+}
+
+/// `--json`: everything the report is made of, for `diff` and other tools.
+/// Counts are samples; `ms_per_s` = samples / rounds * 1000 (thread-ms per
+/// second of wall time).
+pub fn to_json(p: &Profile, a: &Analysis) -> String {
+    let n = |x: f64| Value::Num(x);
+    let s = |x: &str| Value::Str(x.to_string());
+    let threads = a
+        .threads
+        .iter()
+        .map(|t| stats_json(p, &t.stats, vec![("tid".into(), n(f64::from(t.tid))), ("name".into(), s(&t.group)), ("role".into(), s(&t.role))]))
+        .collect();
+    let roles = a.roles.iter().map(|(r, st)| stats_json(p, st, vec![("role".into(), s(r)), ("threads".into(), n(st.threads as f64))])).collect();
+    let v = Value::Obj(vec![
+        ("format".into(), s("kitty6-prof/1")),
+        ("pid".into(), n(f64::from(p.pid))),
+        ("exe".into(), s(&p.exe)),
+        ("seconds".into(), n(p.seconds)),
+        ("hz".into(), n(p.hz)),
+        ("rounds".into(), n(p.rounds as f64)),
+        (
+            "sampler".into(),
+            Value::Obj(vec![
+                ("cpu_s".into(), n(p.sampler_cpu_s)),
+                ("busy_s".into(), n(p.sampler_busy_s)),
+                ("stall_s".into(), n(p.stall_s)),
+                ("walks".into(), n(p.walks as f64)),
+                ("reused".into(), n(p.reused as f64)),
+            ]),
+        ),
+        ("all".into(), stats_json(p, &a.all, vec![("threads".into(), n(a.threads.len() as f64))])),
+        ("roles".into(), Value::Arr(roles)),
+        ("threads".into(), Value::Arr(threads)),
+    ]);
+    let mut out = String::new();
+    json::write(&v, &mut out, 0, 3);
+    out.push('\n');
+    out
+}
+
+/// `--folded`: one line per distinct stack, root first:
+/// `thread [role];outer;...;leaf count`, with a last `[wait: kind]` frame
+/// on samples that wait (flame graph tools take it as one more frame).
+pub fn folded(p: &Profile, a: &Analysis, o: &Options) -> String {
+    let mut lines: HashMap<String, u64> = HashMap::new();
+    for (t, ts) in p.threads.iter().zip(&a.threads) {
+        for (ids, n) in &t.stacks {
+            let frames = frames_of(p, ids);
+            let mut line = format!("{} [{}]", t.group.replace(';', ":"), ts.role);
+            for f in frames.iter().rev() {
+                line.push(';');
+                line.push_str(f);
+            }
+            if let Some(w) = classify(&frames, &o.fence) {
+                let _ = write!(line, ";[wait: {}]", w.kind.name());
+            }
+            *lines.entry(line).or_default() += n;
+        }
+    }
+    let mut v: Vec<_> = lines.into_iter().collect();
+    v.sort();
+    let mut out = String::new();
+    for (l, n) in v {
+        let _ = writeln!(out, "{l} {n}");
+    }
+    out
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -786,6 +891,33 @@ pub mod tests {
         assert_eq!(roles, vec![("list recorders", 2), ("title threads", 1)]);
         let r = report(&p, &a, &Options::default());
         assert!(r.contains("== role list recorders (x2: victory-list-#)"), "{r}");
+    }
+
+    #[test]
+    fn json_and_folded() {
+        let p = profile(vec![
+            (1, "victory-submit", vec![
+                (vec!["ntdll!NtWaitForSingleObject", "kernelbase!WaitForSingleObjectEx", "victory_gpu::host::Host::settle", "victory_gpu::queue::behind::worker"], 40),
+                (vec!["victory_gpu::host::Host::submit", "victory_gpu::queue::behind::worker"], 60),
+            ]),
+        ]);
+        let a = analyze(&p, &Options::default());
+        let j = json::parse(&to_json(&p, &a)).unwrap();
+        assert_eq!(j.f64("rounds"), 100.0);
+        let role = &j.arr("roles")[0];
+        assert_eq!(role.str("role"), "submission");
+        assert_eq!(role.f64("busy"), 60.0);
+        assert_eq!(role.get("wait").unwrap().f64("fence"), 40.0);
+        let w = &role.arr("waits")[0];
+        assert_eq!((w.str("site"), w.str("kind"), w.f64("ms_per_s")), ("victory_gpu::host::Host::settle", "fence", 400.0));
+        assert_eq!(role.get("inclusive").unwrap().f64("victory_gpu::queue::behind::worker"), 100.0);
+        assert_eq!(j.arr("threads")[0].str("name"), "victory-submit");
+        let f = folded(&p, &a, &Options::default());
+        assert_eq!(
+            f,
+            "victory-submit [submission];victory_gpu::queue::behind::worker;victory_gpu::host::Host::settle;kernelbase!WaitForSingleObjectEx;ntdll!NtWaitForSingleObject;[wait: fence] 40\n\
+             victory-submit [submission];victory_gpu::queue::behind::worker;victory_gpu::host::Host::submit 60\n"
+        );
     }
 
     #[test]
