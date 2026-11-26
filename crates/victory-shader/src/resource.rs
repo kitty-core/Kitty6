@@ -2341,6 +2341,24 @@ enum Moved {
     Value(Value),
 }
 
+/// (cool_fox 8cc31ab, Scarlett's switch) `VICTORY_SPILL_STRICT` (default 1; =0: spills
+/// followed through lane moves with modifiers or lanes past the wave too, as before).
+fn spill_strict() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SPILL_STRICT").is_none_or(|v| v != "0"))
+}
+
+fn plain_lane(v: &crate::gfx10::Valu) -> bool {
+    !spill_strict()
+        || (v.abs == 0
+            && v.neg == 0
+            && v.opsel == 0
+            && !v.clamp
+            && v.omod == 0
+            && v.sdwa.is_none()
+            && v.dpp.is_none())
+}
+
 impl Tracer<'_> {
     /// For `v_readlane_b32` of a constant lane: the SGPR spilled to that
     /// lane, found by following the VGPR's `v_writelane_b32` writes.
@@ -2348,13 +2366,17 @@ impl Tracer<'_> {
         let Fields::Valu(v) = &inst.fields else {
             return None;
         };
-        if inst.name() != "v_readlane_b32" {
+        if inst.name() != "v_readlane_b32" || !plain_lane(v) {
             return None;
         }
         let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
             return None;
         };
-        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new())
+        let lane = lane_of(lane)?;
+        if spill_strict() && lane >= if self.p.wave64 { 64 } else { 32 } {
+            return None;
+        }
+        self.spilled(inst.read(Reg::V(reg))?, lane, &mut Vec::new())
             .ok()
             .flatten()
     }
@@ -2385,10 +2407,14 @@ impl Tracer<'_> {
         let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
             return Err(());
         };
-        if inst.name() != "v_writelane_b32" {
+        if inst.name() != "v_writelane_b32" || !plain_lane(w) {
             return Err(());
         }
-        if lane_of(*at).ok_or(())? != lane {
+        let written = lane_of(*at).ok_or(())?;
+        if spill_strict() && written >= if self.p.wave64 { 64 } else { 32 } {
+            return Err(());
+        }
+        if written != lane {
             return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
         }
         match *value {
@@ -2422,9 +2448,15 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
     }
     // A mask of S0 bits from bit S1, as the upscaler's compiler makes an
-    // immediate sampler's word.
-    if let ("s_bfm_b32", 0, [Operand::Const(w), Operand::Const(at)]) = (inst.name(), k, &src[..]) {
-        let (w, at) = (inline(*w)? & 31, inline(*at)? & 31);
+    // immediate sampler's word (inline constants or 32-bit literals).
+    if let ("s_bfm_b32", 0) = (inst.name(), k) {
+        let constant = |o: &Operand| match *o {
+            Operand::Const(c) => inline(c),
+            Operand::Literal(x) => Some(x),
+            _ => None,
+        };
+        let w = constant(src.first()?)? & 31;
+        let at = constant(src.get(1)?)? & 31;
         return Some(Moved::Const(((1u32 << w) - 1) << at));
     }
     let src = src.first()?;

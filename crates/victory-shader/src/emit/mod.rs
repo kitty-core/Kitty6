@@ -3232,3 +3232,65 @@ mod barycentric_tests {
         assert!(pixel(&words, PERSP_CENTER).is_err());
     }
 }
+
+#[cfg(test)]
+mod early_depth_tests {
+    use super::container::SigElement;
+    use crate::native::{HwStage, NativeProgram, StageIo};
+
+    /// (Scarlett, ported from RYUKI-7900XT) The early-depth flag follows DB_SHADER_CONTROL bit
+    /// 12, and never for a program that exports depth, stencil or coverage.
+    #[test]
+    fn a_pixel_program_tested_before_it_runs_declares_early_depth() {
+        // v_mov_b32 v0, 1.0; exp mrt0 v0, v0, v0, v0 done vm; s_endpgm
+        let color = [0x7E00_02F2u32, 0xF800_180F, 0x0000_0000, 0xBF81_0000];
+        // v_mov_b32 v0, 1.0; exp mrtz v0, off, off, off done vm; s_endpgm
+        let depth = [0x7E00_02F2u32, 0xF800_1881, 0x0000_0000, 0xBF81_0000];
+        let el = |name: &str, kind, cols| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            // A render target has a register; depth and stencil do not.
+            row: (kind == 16).then_some(0),
+            col: 0,
+            cols,
+            usage: (1 << cols) - 1,
+            half: false,
+        };
+        let emitted = |words: &[u32], out: SigElement, db: u32| {
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 1,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ps { inputs: vec![], input_addr: 0, db_shader_control: db, patches: vec![] },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let osg1 = super::container::signature(&[out], false);
+            let bytes = crate::dxbc::build(&[(super::FourCC::OSG1, &osg1)]);
+            let c = super::Container::parse(&bytes).unwrap();
+            let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            super::emit(&c, &native, &p, &st, &io, &res).unwrap().dxil
+        };
+        let late = emitted(&color, el("SV_Target", 16, 4), 0x50);
+        let early = emitted(&color, el("SV_Target", 16, 4), 0x1050);
+        assert_ne!(late, early, "the early-depth flag changed nothing");
+        let late = emitted(&depth, el("SV_Depth", 17, 1), 0x51);
+        let early = emitted(&depth, el("SV_Depth", 17, 1), 0x1051);
+        assert_eq!(late, early, "early depth declared for a depth export");
+        let ps = |db| StageIo::Ps { inputs: vec![], input_addr: 0, db_shader_control: db, patches: vec![] };
+        assert!(super::lower::early_depth(&ps(0x1450), &[]));
+        assert!(super::lower::early_depth(&ps(0x1010), &[]));
+        assert!(!super::lower::early_depth(&ps(0x0450), &[]));
+        assert!(!super::lower::early_depth(&ps(0x1012), &[]));
+        assert!(!super::lower::early_depth(&ps(0x1150), &[]));
+        assert!(!super::lower::early_depth(&ps(0x1050), &[el("SV_StencilRef", 20, 1)]));
+        assert!(!super::lower::early_depth(&StageIo::None, &[]));
+    }
+}
