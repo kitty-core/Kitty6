@@ -122,10 +122,12 @@ fn apply(version: u32, path: &str) -> windows::core::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    /// The version is read from the package's DLL where it is there.
+    /// The version is read from the package's DLL where it is there
+    /// (`VICTORY_D3D12_DIR`).
     #[test]
     fn version_of_the_package_dll() {
-        let dll = std::path::Path::new(r"C:\Users\fern\Downloads\gta6-forks\agility-1.620.2\x\build\native\bin\x64\D3D12Core.dll");
+        let Some(dir) = std::env::var_os("VICTORY_D3D12_DIR") else { return };
+        let dll = std::path::Path::new(&dir).join("D3D12Core.dll");
         let Ok(data) = std::fs::read(dll) else { return };
         assert_eq!(super::sdk_version(&data), Ok(620));
         assert!(super::sdk_version(b"MZ not a pe").is_err());

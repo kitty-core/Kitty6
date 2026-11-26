@@ -17,6 +17,9 @@
 #               Low and Medium, a second one too at Low; Medium is what -Lean sets)
 # -Drive        scripted gameplay from -DriveAt seconds (default 200): walks, turns, runs and jumps for
 #               about a minute without your hands (diagnostics build), so measurements see moving play
+# -Console      X or S: the console profile, whatever -Lean picks (-Lean alone is S). X is the
+#               sharper Series X picture; with -Output 1920x1080 it renders 1080p itself
+# -Output       the title's own output size, e.g. 1920x1080 (Series X profile; VICTORY_OUTPUT)
 # -Panel        the run's numbers drawn on the picture (F3 hides and shows them), so screenshots carry them
 # -F8Timeline   F8 in the game records a 3-frame timeline (diagnostics build) to logs\f8.f8-<n>.json/.txt:
 #               where the frame's time went, at the moment you press it
@@ -33,6 +36,8 @@ param(
     [switch]$Drive,
     [double]$DriveAt = 200,
     [switch]$Panel,
+    [ValidateSet('', 'X', 'S')][string]$Console = '',
+    [string]$Output = '',
     [switch]$F8Timeline,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{}
@@ -79,6 +84,7 @@ if ($Quality) { $settings.VICTORY_TEXTURE_MIP_BIAS = @{ Low = '2'; Medium = '1';
 if ($Fps -eq 0) { $settings.VICTORY_FRAME_INTERVAL_MS = '0' }
 elseif ($Fps -gt 0) { $settings.VICTORY_FRAME_INTERVAL_MS = (1000.0 / $Fps).ToString('0.###', [Globalization.CultureInfo]::InvariantCulture) }
 if ($Panel) { $settings.VICTORY_PANEL = '1' }
+if ($Output) { $settings.VICTORY_OUTPUT = $Output }
 if ($F8Timeline) { $settings.VICTORY_TIMELINE = 'key,3,' + (Join-Path $env:LOCALAPPDATA 'victory\logs\f8.json') }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 if ($Drive) {
@@ -109,7 +115,7 @@ if ($discarded) {
 }
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-$console = if ($Lean) { 'series-s' } else { 'series-x' }
+$console = if ($Console) { @{ X = 'series-x'; S = 'series-s' }[$Console] } elseif ($Lean) { 'series-s' } else { 'series-x' }
 $overlayProcess = $null
 if ($Overlay) {
     $overlayExe = Join-Path $PSScriptRoot "..\target\$Build\kitty6-overlay.exe"
