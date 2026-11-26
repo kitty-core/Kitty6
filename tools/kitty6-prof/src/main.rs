@@ -494,6 +494,8 @@ struct Cost {
     rounds: u64,
     /// The sampler's CPU time, s.
     cpu_s: f64,
+    /// The first round, s (loads unwind data and symbols; not in `cpu_s`).
+    first_s: f64,
     /// Wall time spent sampling (not sleeping), s.
     busy_s: f64,
     /// Target threads' time suspended, summed, s, and the walks.
@@ -518,7 +520,7 @@ fn sample(pid: u32, process: HANDLE, seconds: f64, hz: f64) -> (HashMap<u32, Liv
     let mut cost = Cost::default();
     let mut stall = Duration::ZERO;
     let mut busy = Duration::ZERO;
-    let cycles0 = own_cycles();
+    let mut cycles0 = own_cycles();
     while Instant::now() < end {
         let t0 = Instant::now();
         if last_list.elapsed() > Duration::from_secs(1) {
@@ -603,6 +605,13 @@ fn sample(pid: u32, process: HANDLE, seconds: f64, hz: f64) -> (HashMap<u32, Liv
         }
         cost.rounds += 1;
         busy += t0.elapsed();
+        if cost.rounds == 1 {
+            // The first round loads the modules' unwind data and symbols:
+            // a one-time cost, kept apart from the steady cost.
+            cost.first_s = t0.elapsed().as_secs_f64();
+            cycles0 = own_cycles();
+            busy = Duration::ZERO;
+        }
         // Rounds on a fixed grid; a late round does not push the rest back.
         next += period;
         let now = Instant::now();
@@ -718,6 +727,7 @@ fn main() {
         threads,
         sampler_cpu_s: cost.cpu_s,
         sampler_busy_s: cost.busy_s,
+        sampler_first_s: cost.first_s,
         stall_s: cost.stall_s,
         walks: cost.walks,
         exe: mods.first().map(|m| m.2.clone()).unwrap_or_default(),

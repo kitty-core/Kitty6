@@ -39,6 +39,8 @@ pub struct Profile {
     pub sampler_cpu_s: f64,
     /// Wall time the sampler spent sampling (not sleeping), s.
     pub sampler_busy_s: f64,
+    /// The first round (one-time loading of unwind data), s; not in the above.
+    pub sampler_first_s: f64,
     /// Time the target's threads spent suspended by the sampler, s (summed).
     pub stall_s: f64,
     pub walks: u64,
@@ -525,11 +527,12 @@ pub fn report(p: &Profile, a: &Analysis, o: &Options) -> String {
     let _ = writeln!(r, "kitty6-prof: pid {}, {} rounds in {secs} s ({:.0} Hz achieved of {})", p.pid, p.rounds, p.rounds as f64 / secs, p.hz);
     let _ = writeln!(
         r,
-        "sampler: CPU {:.1}% of one core ({:.2} s; busy {:.1}% of the wall time); {} walks, {:.0}% of samples reused (thread had not run);\n         \
-         a walked thread is suspended {:.0} us on average, {:.2}% of the threads' time\n",
+        "sampler: CPU {:.1}% of one core ({:.2} s; busy {:.1}% of the wall time; first round {:.0} ms loading unwind data, not counted);\n         \
+         {} walks, {:.0}% of samples reused (thread had not run); a walked thread is suspended {:.0} us on average, {:.2}% of the threads' time\n",
         100.0 * p.sampler_cpu_s / secs,
         p.sampler_cpu_s,
         100.0 * p.sampler_busy_s / secs,
+        1000.0 * p.sampler_first_s,
         p.walks,
         pct(p.reused, p.walks + p.reused),
         1e6 * p.stall_s / p.walks.max(1) as f64,
@@ -690,6 +693,7 @@ pub fn to_json(p: &Profile, a: &Analysis) -> String {
             Value::Obj(vec![
                 ("cpu_s".into(), n(p.sampler_cpu_s)),
                 ("busy_s".into(), n(p.sampler_busy_s)),
+                ("first_round_s".into(), n(p.sampler_first_s)),
                 ("stall_s".into(), n(p.stall_s)),
                 ("walks".into(), n(p.walks as f64)),
                 ("reused".into(), n(p.reused as f64)),
@@ -837,7 +841,7 @@ pub mod tests {
                 .collect();
             out.push(ThreadData { tid, group: group.to_string(), described: !group.starts_with('('), stacks });
         }
-        Profile { pid: 1, seconds: 1.0, hz: 100.0, rounds: 100, names, threads: out, sampler_cpu_s: 0.01, sampler_busy_s: 0.01, stall_s: 0.0, walks: 1, reused: 0, exe: "victory.exe".into() }
+        Profile { pid: 1, seconds: 1.0, hz: 100.0, rounds: 100, names, threads: out, sampler_cpu_s: 0.01, sampler_busy_s: 0.01, sampler_first_s: 0.0, stall_s: 0.0, walks: 1, reused: 0, exe: "victory.exe".into() }
     }
 
     #[test]

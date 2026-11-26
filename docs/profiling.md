@@ -69,11 +69,19 @@ time on one lock are 6000 ms/s at that site. Percentages are of the thread's
 
 Stacks are kept as raw addresses and named once at the end; target memory is
 read a page at a time and cached; threads that have not run since their last
-walk are not suspended again. Measured on `examples/target.rs` (14 threads:
-lock holders and queuers, a condition variable, sleepers): 2.9% of one core at
-50 Hz, 4.5% at 200 Hz; a walked thread is suspended ~40 µs. The game has many
-more threads, so read the `sampler:` line of each report; 50 Hz for 20 s is
-enough for the shares that matter.
+walk are not suspended again. Measured on `examples/target.rs` (9 threads:
+lock holders and queuers, a condition variable, sleepers, a spinner), 15-45 s
+runs, steady state (the first round, ~30-40 ms loading unwind data, apart):
+
+| Rate | Sampler CPU (one core) | Samples reused | A walked thread suspended | Target threads' time suspended |
+|---|---|---|---|---|
+| 50 Hz | 3.5-4.3% | 53% | ~58 µs | 0.13-0.15% |
+| 200 Hz | 4.4-5.4% | 71% | ~58 µs | 0.32-0.34% |
+
+(Per walk the sampler is slower at 50 Hz: its core sleeps longer between
+rounds.) Before the page cache a walk suspended the thread ~350 µs. The game
+has many more threads, so read the `sampler:` line of each report; 50 Hz for
+20 s is enough for the shares that matter.
 
 ## Flame graphs
 
