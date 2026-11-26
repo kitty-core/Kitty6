@@ -755,6 +755,21 @@ fn recheck_every() -> u64 {
     })
 }
 
+/// Frames between looks, once [`RECHECK_FRAMES`] is through, at an uploaded
+/// texture picked by index whose pages the title also shows at other
+/// addresses (`K6_ALIASED_RECHECK_EVERY=<frames>`; 0: as any other texture;
+/// unset: 30). The title paints such textures (faces, hair) through the
+/// other view with nothing to tell of it here, long after their upload: the
+/// fixed schedule found changes at its last looks, and what changed after
+/// stayed stale on the card for the rest of the run. A look at one reads it
+/// whole (`crate::texture::fingerprint_texture`).
+fn aliased_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("K6_ALIASED_RECHECK_EVERY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(30)
+    })
+}
+
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -2460,7 +2475,7 @@ impl State {
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+                if crate::texture::fingerprint_texture(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
@@ -2470,6 +2485,15 @@ impl State {
                         // frames for as long as the slot shows it
                         // (`recheck_every`), or never again.
                         None => match recheck_every() {
+                            0 if aliased_every() > 0 && crate::texture::aliased(at, len) => host.texture_slot_recheck(
+                                index,
+                                write,
+                                frame + aliased_every(),
+                                (at, len),
+                                print,
+                                looks,
+                                uploaded,
+                            ),
                             0 => host.texture_slot_done(index, write, None),
                             every => {
                                 host.texture_slot_recheck(index, write, frame + every, (at, len), print, looks, uploaded)
@@ -2652,7 +2676,7 @@ impl State {
                 let memory = if again.is_none() && heap_recheck() { crate::texture::title_span(resource, first) } else { None };
                 match memory {
                     Some((at, len)) => {
-                        let print = crate::texture::fingerprint(at, len);
+                        let print = crate::texture::fingerprint_texture(at, len);
                         host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
                     }
                     None => host.texture_slot_done(index, write, again),
@@ -2777,7 +2801,7 @@ impl State {
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
-                    let print = crate::texture::fingerprint(at, len);
+                    let print = crate::texture::fingerprint_texture(at, len);
                     host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),

@@ -1712,6 +1712,59 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
     u64::from_le_bytes(first) | 1
 }
 
+/// The most bytes [`fingerprint_texture`] reads whole for a texture whose
+/// pages the title also shows at other addresses (`K6_FULL_PRINT_KB`; 0:
+/// never, [`fingerprint`]'s three 16 KiB windows for all, as before; unset:
+/// 4096, so 4 MiB).
+fn full_print_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("K6_FULL_PRINT_KB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(4096) << 10
+    })
+}
+
+/// Whether the title shows some 64 KiB page of `[at, at + len)` at another
+/// address too: what it writes there the guards and the runtime tell of at
+/// that address alone, so the texture changes with nothing to tell of it.
+pub(crate) fn aliased(at: u64, len: u64) -> bool {
+    !crate::inplace::shown_elsewhere(at as usize & !0xffff, (at + len) as usize).is_empty()
+}
+
+/// The fingerprint the texture pass keeps for an uploaded texture at title
+/// memory `[at, at + len)`: [`fingerprint`]'s, but of all of it for a texture
+/// whose pages are shown at other addresses too ([`aliased`]), up to
+/// [`full_print_bytes`]. The title paints such textures (faces, hair)
+/// through the other view a part at a time; a part outside the three
+/// sampled windows went unseen and stayed stale on the card (blocky tiles).
+/// The same memory gives the same print as long as its aliasing stands; a
+/// change of that only costs one upload more.
+pub(crate) fn fingerprint_texture(at: u64, len: u64) -> u64 {
+    const WINDOW: usize = 64 << 10;
+    let most = full_print_bytes();
+    let n = len as usize;
+    if n <= 48 << 10 || n > most || !aliased(at, len) {
+        return fingerprint(at, len);
+    }
+    thread_local! {
+        static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let mut print = 0x6b36_u128;
+    READ.with(|read| {
+        let mut read = read.borrow_mut();
+        read.resize(WINDOW, 0);
+        let mut from = 0;
+        while from < n {
+            let bytes = WINDOW.min(n - from);
+            read[..bytes].fill(0);
+            crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
+            print = print.rotate_left(37) ^ digest(&read[..bytes]).0;
+            from += bytes;
+        }
+    });
+    let first = (print as u64 ^ (print >> 64) as u64).to_le_bytes();
+    u64::from_le_bytes(first) | 1
+}
+
 /// Whether a title texture has a staging buffer: a list recorded its
 /// upload, and the lists that sample it check it at submission.
 /// For the frame listing: whether a list has uploaded `resource`'s staging
