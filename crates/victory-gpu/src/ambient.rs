@@ -254,6 +254,15 @@ fn shade() -> [f32; 2] {
     })
 }
 
+/// `VICTORY_AMBIENT_MAGENTA=0` keeps what the title's probe program left even
+/// where it is magenta (green far below red and blue); unset or anything else
+/// drops such values before they are blended in: stale probe memory, not
+/// light, seen as flat purple and pink glows indoors. From Fayberr/Victory-United
+/// 1bf62e10 (beloooo; the ambient line of Belobug/VIctory-Belobug-AMD 81ebb7bd).
+fn magenta() -> bool {
+    std::env::var_os("VICTORY_AMBIENT_MAGENTA").is_none_or(|v| v != "0")
+}
+
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=15, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
 #define CX 64
@@ -493,6 +502,11 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     float3 was = unpack(light[p]);
+#ifdef DROP_MAGENTA
+    // Magenta (green far below red and blue) is what the probes' memory held,
+    // not light: it showed as flat purple and pink glows ([`magenta`]).
+    if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
+#endif
     float left = dot(was, LUMA);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
@@ -544,7 +558,8 @@ unsafe impl Sync for Pass {}
 fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -> windows::core::Result<Pass> {
     let mut root: Option<ID3D12RootSignature> = None;
     let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
-        let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
+        let drop = if magenta() { "#define DROP_MAGENTA\n" } else { "" };
+        let code = crate::host::compile(&format!("#define {part}\n{drop}{SOURCE}"), entry, s!("cs_5_1"))?;
         // SAFETY: the root signature is inside the shader; plain creations.
         unsafe {
             if root.is_none() {
