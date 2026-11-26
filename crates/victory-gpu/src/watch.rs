@@ -3284,10 +3284,20 @@ impl Drop for KernelWrite {
 /// 1, the guarded blocks under it are opened and count as written (host
 /// copies of buffers and textures read through tables take them again);
 /// 2, the placed textures picked by index that lie under it are due again;
-/// 4, both also for reads to plain addresses when they have finished.
-/// Unset or `guards`: bit 1 alone. `0`: nothing, counted only (the default
-/// until run 199). `1`: bits 1 and 2. `slots`: bit 2 alone. `all`:
-/// everything.
+/// 4, both also for reads to plain addresses when they have finished;
+/// 8, for reads to plain addresses the textures alone (bit 2's look).
+/// Unset: bits 1, 2 and 8. `guards`: bit 1 alone (the default before
+/// fxceless e4245f3c1b). `0`: nothing, counted only (the default until run
+/// 199). `1`: bits 1 and 2. `slots`: bit 2 alone. `all`: everything.
+///
+/// Bits 2 and 8 by default (after fxceless e4245f3c1b, the black and
+/// blocky faces): a read makes the placed textures under it due before it
+/// begins ([`writing`]), and the texture pass uploads them while the read
+/// is under way, from memory that does not hold the bytes yet; nothing
+/// asked again once they were there, so the card kept zeros or old bytes.
+/// Only slots uploaded before the bytes landed are made due again
+/// (`HostHeap::texture_slots_page_written`): a slot still waiting for its
+/// first upload takes the bytes that are there by then.
 /// (Bit 1 by default: in every run 10,000 to 50,000 guarded blocks of host
 /// copies lay under such writes and kept the bytes from before; runs 197
 /// and 198 opened them, 9,766 and 10,796 blocks, with nothing worse for
@@ -3299,8 +3309,9 @@ pub(crate) fn page_writes() -> u8 {
         Ok("0") => 0,
         Ok("1") => 3,
         Ok("slots") => 2,
-        Ok("all") => 7,
-        _ => 1,
+        Ok("guards") => 1,
+        Ok("all") => 15,
+        _ => 1 | 2 | 8,
     })
 }
 
@@ -3308,8 +3319,9 @@ pub(crate) fn page_writes() -> u8 {
 /// views that landed at addresses the title has mapped (one for each run
 /// of addresses); their bytes; guarded blocks that lay under them (host
 /// copies that would otherwise keep the bytes from before); reads to
-/// plain addresses that finished.
-pub(crate) static WRITTEN: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// plain addresses that finished; of those, the ones passed to the texture
+/// pass (bit 8 or 4 of [`page_writes`]).
+pub(crate) static WRITTEN: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// The bytes of a write the guards do not see are there: title memory
 /// `[at, at + len)`. `pages`: DirectStorage wrote them into physical pages
@@ -3337,7 +3349,13 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
         WRITTEN[1].fetch_add(len as u64, Relaxed);
     } else {
         WRITTEN[3].fetch_add(1, Relaxed);
+        if mode & (4 | 8) == 0 {
+            return;
+        }
+        WRITTEN[4].fetch_add(1, Relaxed);
         if mode & 4 == 0 {
+            // (Bit 8 alone: the placed textures under it, not the guards.)
+            crate::descriptor::host::page_written(at, len);
             return;
         }
     }
