@@ -176,12 +176,74 @@ pub fn helper_own() -> bool {
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn group_sync() -> u8 {
+    let mode = group_sync_switch();
+    // (the program being translated is one [`sync_full`] names: every barrier waits)
+    if mode == 1 && SYNC_FULL.with(std::cell::Cell::get) { 2 } else { mode }
+}
+
+/// `VICTORY_GROUP_SYNC`'s mode for every program ([`group_sync`]).
+fn group_sync_switch() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_GROUP_SYNC").ok().as_deref().map(str::trim) {
         Some("0") => 0,
         Some("1") => 1,
         _ => 2,
     })
+}
+
+thread_local! {
+    /// The program being translated has every barrier wait ([`sync_full`]).
+    static SYNC_FULL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the program in `container` translates with every group barrier waiting
+/// ([`group_sync`] 2) when `VICTORY_GROUP_SYNC=1` drops the waits of the others.
+/// `VICTORY_GROUP_SYNC_FULL=a,b`: programs whose name holds one of these (`none`: no
+/// program); unset: `CS_Shadow,RasterClassification`. (`VICTORY_GROUP_SYNC=0`, the
+/// diagnostics mode with no wait at all, is left as it is.)
+///
+/// From voidopcode/vilocity bb0835ab and 3cbad4a9 (`VILOCITY_GROUP_SYNC_FULL` there), on
+/// 32-lane hosts: in the tiled shadow programs (`CS_ShadowRenderTiled*`) a lane that left a
+/// loop early passed a barrier whose wait was dropped, and the other half-wave read
+/// group-shared memory before it was written: rows of orange dashes. The shadow tile
+/// classification (`CS_CalcRasterClassificationListCounts`,
+/// `CS_WriteRasterClassificationResults`, 1024 threads a group) clears 4 KiB of group-shared
+/// memory from thread 0, then a barrier, then each console wave's first lane writes its tile
+/// count there; their loops can be cut at the iteration limit, so the barrier lost its wait
+/// and the clear wiped waves 1-15's counts. The tiles left out kept the clear's "lit": orange
+/// bars on heads and shirts.
+fn sync_full(container: &[u8]) -> bool {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        sync_full_names(std::env::var("VICTORY_GROUP_SYNC_FULL").ok().as_deref())
+    });
+    sync_full_in(names, container)
+}
+
+/// [`sync_full`]'s names for the switch's value. Pure, for testing.
+fn sync_full_names(value: Option<&str>) -> Vec<String> {
+    value
+        .unwrap_or("CS_Shadow,RasterClassification")
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty() && *n != "none")
+        .map(str::to_owned)
+        .collect()
+}
+
+/// [`sync_full`] with the names given: the program's name is the one that ends in
+/// `_Wrapped` in the container. Pure, for testing.
+fn sync_full_in(names: &[String], container: &[u8]) -> bool {
+    if names.is_empty() {
+        return false;
+    }
+    const END: &[u8] = b"_Wrapped";
+    let Some(at) = container.windows(END.len()).position(|w| w == END) else {
+        return false;
+    };
+    let before = &container[at.saturating_sub(100)..at];
+    let name = before.rsplit(|b| !b.is_ascii_alphanumeric() && *b != b'_').next().unwrap_or_default();
+    names.iter().any(|n| name.windows(n.len()).any(|w| w == n.as_bytes()))
 }
 
 /// Whether buffer atomics of the ray-tracing structure builder stand between
@@ -433,6 +495,13 @@ pub struct UserData {
 /// a program: with that on for every program, 69 compute programs that
 /// already translated came out changed (`CS_RaytracingResolve`, ...).
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    let was = SYNC_FULL.replace(group_sync_switch() == 1 && sync_full(container));
+    let r = translate_retrying(container);
+    SYNC_FULL.set(was);
+    r
+}
+
+fn translate_retrying(container: &[u8]) -> Result<HostShader, ShaderError> {
     match translate_plain(container) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
             lower::with_first_half_pairs(|| translate_plain(container))
@@ -1208,6 +1277,26 @@ mod tests {
         for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
         }
+    }
+
+    /// (voidopcode/vilocity bb0835ab, 3cbad4a9) Only the tiled shadow programs and the
+    /// shadow tile classification wait at every barrier by default.
+    #[test]
+    fn shadow_programs_wait_at_every_barrier() {
+        let names = sync_full_names(None);
+        let full = |c: &[u8]| sync_full_in(&names, c);
+        assert!(full(b"\0\0CS_ShadowRenderTiledMiscCB_9945271c_Wrapped\0"));
+        assert!(full(b"x CS_ShadowRenderTiledCascades_9945271c_Wrapped"));
+        assert!(full(b"x CS_ShadowUnifiedClearRaster_6bcdd348_Wrapped"));
+        assert!(full(b"x CS_CalcRasterClassificationListCounts_71bbdf9d_Wrapped"));
+        assert!(full(b"x CS_WriteRasterClassificationResults_71bbdf9d_Wrapped"));
+        assert!(!full(b"x CS_GenerateShadowMasks_Checkerboard_NoHair_5e982407_Wrapped"));
+        assert!(!full(b"\0CS_FinalGather_0_1_1_0_a1d0fa7d_Wrapped\0"));
+        assert!(!full(b"no name here"));
+        assert!(sync_full_names(Some("none")).is_empty());
+        let mine = sync_full_names(Some(" FinalGather , "));
+        assert!(sync_full_in(&mine, b"\0CS_FinalGather_0_1_1_0_a1d0fa7d_Wrapped\0"));
+        assert!(!sync_full_in(&mine, b"x CS_ShadowRenderTiledCascades_9945271c_Wrapped"));
     }
     use super::container::SigElement;
     use super::shader::Shader;

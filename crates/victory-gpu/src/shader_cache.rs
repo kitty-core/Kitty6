@@ -111,6 +111,7 @@ fn build() -> [u8; 32] {
         // executable had cached with the switch unset.
         for name in [
             "VICTORY_WAVE_WIDE",
+            "VICTORY_GROUP_SYNC_FULL",
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_WAVE_LOCAL",
@@ -127,6 +128,7 @@ fn build() -> [u8; 32] {
             "VICTORY_EARLY_DEPTH",
             "VICTORY_D16_BITS",
             "VICTORY_NAN_GUARD",
+            "VICTORY_NAN_SCRUB",
             "VICTORY_SPILL_STRICT",
         ] {
             bytes.extend_from_slice(name.as_bytes());

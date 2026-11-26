@@ -2083,6 +2083,16 @@ fn d16_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_D16_BITS").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_NAN_SCRUB=1` (off unless `1`): typed image and buffer stores of floats get
+/// [`Lower::nan_scrub`]. From fxceless/victory-fork PR #837 (PastiiJay 23da1ac3, made
+/// opt-in in 45c59247 as `VICTORY_NAN_GUARD=stores`): typed stores go out as `.f32`
+/// whatever the view's format, so the integer words 0x7F800000, 0xFF800000, 0x7FC00000
+/// and 0xFFC00000 (0xFF800000 is an opaque blue as packed RGBA8) change too.
+fn nan_scrub_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NAN_SCRUB").is_some_and(|v| v == "1"))
+}
+
 /// (Neptune 25fbf69, Scarlett) `VICTORY_NAN_GUARD` (on unless `0`).
 fn nan_guard_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -8359,6 +8369,33 @@ impl<'a> Lower<'a> {
         self.as_float(r)
     }
 
+    /// (`VICTORY_NAN_SCRUB=1`) A float a typed image or buffer store writes, with the NaN
+    /// the GPU makes (0x7FC00000, either sign) made 0 and an infinity +-65504, so one bad
+    /// texel a compute pass writes does not stay in a history (black blobs on faces). Only
+    /// those patterns: the store may carry an integer's bits, and other NaN patterns are
+    /// common integers. Raw buffer stores are left as they are (no type to go by).
+    fn nan_scrub(&mut self, f: V) -> V {
+        if !nan_scrub_on() {
+            return f;
+        }
+        let c = self.cur;
+        let bits = self.as_int(f);
+        let mag = self.s.m.i32(0x7FFF_FFFF);
+        let abs = self.s.m.bin(c, Bin::And, bits, mag);
+        let quiet = self.s.m.i32(0x7FC0_0000);
+        let nan = self.s.m.cmp(c, pred::EQ, abs, quiet);
+        let inf_bits = self.s.m.i32(0x7F80_0000);
+        let inf = self.s.m.cmp(c, pred::EQ, abs, inf_bits);
+        let sign_bit = self.s.m.i32(0x8000_0000);
+        let sign = self.s.m.bin(c, Bin::And, bits, sign_bit);
+        let big = self.s.m.i32(65504f32.to_bits());
+        let big = self.s.m.bin(c, Bin::Or, sign, big);
+        let zero = self.s.m.i32(0);
+        let r = self.s.m.select(c, inf, big, bits);
+        let r = self.s.m.select(c, nan, zero, r);
+        self.as_float(r)
+    }
+
     /// (Scarlett, `VICTORY_D16_BITS`) A d16 load's 16 bits from `x`, the 32-bit value a
     /// float-typed image load returned. Through a view of an integer format the host passes
     /// the integer's bits unconverted: a 16-bit unsigned (or non-negative signed) value is a
@@ -12218,6 +12255,7 @@ impl<'a> Lower<'a> {
                     self.float_of(v)?
                 });
             }
+            let vals: Vec<V> = vals.into_iter().map(|v| self.nan_scrub(v)).collect();
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
             let mut args = vec![h];
@@ -13227,7 +13265,12 @@ impl<'a> Lower<'a> {
                 args.push(self.handle(site, src, false, (10 | u, component))?);
                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
                 for x in vals {
-                    args.push(if halves { x } else { self.as_float(x) });
+                    args.push(if halves {
+                        x
+                    } else {
+                        let f = self.as_float(x);
+                        self.nan_scrub(f)
+                    });
                 }
                 (
                     69,
