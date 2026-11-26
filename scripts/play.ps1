@@ -115,7 +115,7 @@ if ($discarded) {
 }
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-$console = if ($Console) { @{ X = 'series-x'; S = 'series-s' }[$Console] } elseif ($Lean) { 'series-s' } else { 'series-x' }
+$consoleProfile = if ($Console) { @{ X = 'series-x'; S = 'series-s' }[$Console] } elseif ($Lean) { 'series-s' } else { 'series-x' }
 $overlayProcess = $null
 if ($Overlay) {
     $overlayExe = Join-Path $PSScriptRoot "..\target\$Build\kitty6-overlay.exe"
@@ -126,7 +126,7 @@ if ($Overlay) {
         Write-Host "No $overlayExe. Build it: cargo build --profile $Build -p kitty6-overlay"
     }
 }
-try { & $victory run $Exe --execute --console $console } finally {
+try { & $victory run $Exe --execute --console $consoleProfile } finally {
     Pop-Location
     if ($overlayProcess -and -not $overlayProcess.HasExited) { Stop-Process -Id $overlayProcess.Id -ErrorAction SilentlyContinue }
 }
