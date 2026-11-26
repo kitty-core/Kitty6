@@ -10268,8 +10268,31 @@ impl Host {
                     .is_ok()
             };
             let supported = ok && options.GPUUploadHeapSupported.as_bool();
-            tracing::info!(supported, "card memory the CPU maps");
-            supported
+            // `VICTORY_FORCE_GPU_UPLOAD=1`: try a buffer there even when the
+            // runtime says no (to tell a refused query from a refused heap).
+            let forced = !supported && std::env::var_os("VICTORY_FORCE_GPU_UPLOAD").is_some_and(|v| v == "1");
+            let made = forced && {
+                let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_GPU_UPLOAD, ..Default::default() };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 1 << 16,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                let mut made: Option<ID3D12Resource> = None;
+                // SAFETY: plain descriptions; the result is dropped.
+                let r = unsafe {
+                    self.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut made)
+                };
+                tracing::warn!(result = ?r.as_ref().err(), "a buffer in card memory the CPU maps, forced (VICTORY_FORCE_GPU_UPLOAD)");
+                r.is_ok() && made.is_some()
+            };
+            tracing::warn!(query_ok = ok, supported, tier = options.GPUUploadHeapSupported.as_bool(), forced, made, "card memory the CPU maps");
+            supported || made
         })
     }
 
