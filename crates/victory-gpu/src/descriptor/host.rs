@@ -331,14 +331,17 @@ struct Flip {
 }
 
 /// Whether a title slot shows a texture that is new to it only once the
-/// submission with its upload has finished (`VICTORY_SHOW_AFTER=1`; off).
+/// submission with its upload has finished (`VICTORY_SHOW_AFTER`; on,
+/// `0` turns it off).
 /// Shown at once, the lists already on the card read it by index while it is
 /// made: all three losses whose report had the address book (n08, n11, n15)
 /// were page faults in a texture made and shown in the last tenth of a
-/// second.
+/// second. And a texture cut from a pooled block that was used before
+/// shows that block's old bytes until its upload lands: in the opening
+/// cutscene the car seat was a green and blue checkerboard for two seconds.
 pub(crate) fn show_after() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SHOW_AFTER").is_some_and(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHOW_AFTER").is_none_or(|v| v != "0"))
 }
 
 /// Whether a title slot that would show a texture made while submissions
