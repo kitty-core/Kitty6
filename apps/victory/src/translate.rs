@@ -71,6 +71,10 @@ struct Tally {
     ms_pipelines: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
+    /// With the paired form tried first (`VICTORY_WAVE_PAIRED_ONLY`): the programs it took,
+    /// and why it refused the others (reason → programs, the first one).
+    paired: usize,
+    paired_refused: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
@@ -136,6 +140,10 @@ impl Tally {
         self.lines.extend(other.lines);
         for (reason, (n, example)) in other.failed {
             self.failed.entry(reason).or_insert((0, example)).0 += n;
+        }
+        self.paired += other.paired;
+        for (reason, (n, example)) in other.paired_refused {
+            self.paired_refused.entry(reason).or_insert((0, example)).0 += n;
         }
     }
 }
@@ -362,6 +370,18 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    if t.paired > 0 || !t.paired_refused.is_empty() {
+        let refused: usize = t.paired_refused.values().map(|(n, _)| n).sum();
+        println!(
+            "paired form  {} wave64 compute programs taken, {refused} refused (they go on through the other forms)",
+            t.paired
+        );
+        let mut why: Vec<_> = t.paired_refused.iter().collect();
+        why.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
+        for (reason, (n, example)) in why {
+            println!("  {n:>7}  paired: {reason}  (e.g. {example})");
+        }
+    }
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -528,7 +548,9 @@ fn translate(
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
     let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
-    translate_programs(&container, programs, &example, t, checks);
+    // (`VICTORY_WAVE_PAIRED_ONLY` / `_NOT`: what they say of this container, by its hash)
+    let choice = emit::paired_lists_set().then(|| emit::paired_choice(&hash)).flatten();
+    emit::with_paired_choice(choice, || translate_programs(&container, programs, &example, t, checks));
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);
@@ -605,7 +627,23 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(container, &p, &program, &s, &i, &r) {
+                    let emitted = emit::emit(container, &p, &program, &s, &i, &r);
+                    match emit::take_paired_outcome() {
+                        Some(Ok(())) => {
+                            t.paired += 1;
+                            if t.list {
+                                t.lines.push(format!("{}  paired form", label()));
+                            }
+                        }
+                        Some(Err(why)) => {
+                            if t.list {
+                                t.lines.push(format!("{}  paired form refused: {why}", label()));
+                            }
+                            t.paired_refused.entry(why).or_insert_with(|| (0, label())).0 += 1;
+                        }
+                        None => {}
+                    }
+                    match emitted {
                         Ok(shader) => {
                             census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;
