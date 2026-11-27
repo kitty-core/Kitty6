@@ -663,7 +663,12 @@ pub fn paired_by_default(hash: &str) -> bool {
 ///   `_GenerateTiles`): dark blocks on open water;
 /// - the atmospheric diffusion and its depth scan (7): a halo around dark silhouettes
 ///   against the sky.
-pub const DEFAULT_PAIRED: [&str; 29] = [
+///
+/// Added by Kitty6, not Vice-Tay: `CS_TransmissionVolumetrics_VolumePortalsOnly`
+/// (a10179ab7eda0dc3), which no other form translates on 32-lane hosts (its dispatches were
+/// dropped); with the paired form and its FP32 sums replayed it translates and validates
+/// (offline, `VICTORY_HOST_MAX_WAVE=32`). Not yet checked in game.
+pub const DEFAULT_PAIRED: [&str; 30] = [
     // shadow mask
     "191ecaed66eea3b1", "1d44a723bdebbf27", "20b78ee12ecdb57d", "240cb516c1af0bc3",
     "31d703207b51549a", "466ec41d3f9d24c0", "56f3bf2d9388e5a7", "65de113e23fa4fdd",
@@ -672,6 +677,8 @@ pub const DEFAULT_PAIRED: [&str; 29] = [
     "f133e35efed2a48a", "fa0bd10a35bfef3c",
     // water
     "5dc3b25986622949", "6f225b641c5b0708", "926c46bab3b86bd6", "1aa247ed3653b616",
+    // water, added by Kitty6 (not in Vice-Tay's list)
+    "a10179ab7eda0dc3",
     // diffusion / sky
     "ce2378e5e8711aad", "b7953a05b189dfc1", "71883e40620a567a",
     "3c196d81eca7ff15", "acf14a70f37fb012", "f79824724d8e2daf", "f0aa2b1e79275592",
