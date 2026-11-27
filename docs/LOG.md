@@ -9,6 +9,23 @@ Figures come from scripted runs on one PC (RTX 4070 12 GB, 32 GB RAM, Windows 11
 23H2, Series S profile, opening scene): each is the run's median over its last
 45 s in the world, from the run probes.
 
+## 2026-11-26 (later that night)
+
+- **PC controls** (on `dev`, not yet tried in the game): mouse camera,
+  mouse-button triggers, Shift sprint, Space jump, F interact, R reload, Q
+  cover, Tab wheel, Ctrl crouch (README, "Controls"). `K6_CONTROLS=pad` for
+  the old layout.
+- **RAM:** the game asks Windows to keep half the PC's RAM of it resident (a
+  soft minimum working set, `K6_MIN_WORKING_SET_MB`), so the trimmer takes from
+  idle programs first. Being tested.
+- **Focus matters:** the game runs noticeably faster with its window in front
+  (Windows favours that window for time slices, the GPU and memory). Probes
+  now record it (`focused` column); earlier scripted runs were unfocused.
+- **Where the 22 GB goes:** ~5.3 GB copies of title memory, ~4.1 GB grown
+  while the 1,501 host command lists were made (being cut), ~2.2 GB textures,
+  ~1.3 GB our heap; the rest is the title's own memory.
+- [docs/probe-runs.md](probe-runs.md): every saved run and what it showed.
+
 ## 2026-11-26 (night)
 
 **Blocky shadows and faces: fixed.** The stair-stepped sun-shadow edges, square
