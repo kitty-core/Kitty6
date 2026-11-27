@@ -23,7 +23,7 @@ Figures come from scripted runs on one PC (RTX 4070 12 GB, 32 GB RAM, Windows 11
   `VICTORY_SKIP_WC_BACK`/`_KEEP`, `VICTORY_MERGE_SUBMISSIONS` (off), the placement census,
   `VICTORY_STAGING_SETTLE_S`, `VICTORY_LIST_POOL_IDLE_S` (off).
 - 2/3 render scale on the Series X profile: 5.5 fps, 23,800 pages in/s. Ruled out.
-- Water glitches and the prison-scene gradient: suspects are the five CS_TransmissionVolumetrics programs
+- The prison-scene gradient was the scene's own lighting (not a bug). Water glitches: suspects were the five CS_TransmissionVolumetrics programs
   translated with APPROXIMATE wave64 emulation, and the water reflection passes. An exact translation is in
   progress. Skipping them by mod rule cleaned the water in shots.
 - Live numbers: https://kitty-core.github.io
