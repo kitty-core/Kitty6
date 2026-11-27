@@ -13,6 +13,8 @@ translates and runs the files you supply ([docs/asset-policy.md](docs/asset-poli
 
 **Not playable yet.** In-game, with a recognisable picture, below a steady 30 fps.
 
+Live numbers: [Kitty6 Playability](https://kitty-core.github.io)
+
 Measured on one PC: RTX 4070 12 GB (driver 610.88), 32 GB RAM, Windows 11 23H2,
 the smaller console's profile (`scripts\play.ps1 -Lean`) unless said otherwise.
 These are the maintainer's own figures from runs of about 4 to 5 minutes; none
@@ -131,6 +133,8 @@ More on running, the commands and every switch: [docs/README-7900XTX.md](docs/RE
   footage to PNG, frame shots, timelines, autopilot (walk, run, wander), marks, mods
   off/on for A/B timing in one run.
 - `tools/charts`: the charts above, from the run probes.
+- [Kitty6 Playability](https://kitty-core.github.io): the playability gates, run-by-run
+  charts and open issues as a page; `tools/charts/site_csv.py` writes its data.
 - The in-picture panel (`-Panel`), F8 timelines (`-F8Timeline`), scripted input
   (`-Drive`, `VICTORY_KEYS`) and per-buffer traffic reports in the log.
 
