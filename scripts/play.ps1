@@ -65,6 +65,9 @@ $settings = @{
     # shadows and faces blocky on NVIDIA (stair-stepped shadow edges, square cut-outs;
     # gone with both off, 2026-11-26). -More @{VICTORY_HALF_VIEWS='1'; K6_HALF_LOADS='1'} to try them.
     VICTORY_HALF_VIEWS = '0'; K6_HALF_LOADS = '0'
+    # mimalloc hands freed pages back to Windows after 10 ms and takes them again as
+    # fresh zeroed pages (~45,000 faults in 12 s in a fault trace): keep them 1 s.
+    MIMALLOC_PURGE_DELAY = '1000'
 }
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'

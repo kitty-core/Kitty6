@@ -286,7 +286,8 @@ fn keep_resident() {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     use windows_sys::Win32::System::Memory::{
-        QUOTA_LIMITS_HARDWS_MAX_DISABLE, QUOTA_LIMITS_HARDWS_MIN_DISABLE, SetProcessWorkingSetSizeEx,
+        QUOTA_LIMITS_HARDWS_MAX_DISABLE, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MIN_ENABLE,
+        SetProcessWorkingSetSizeEx,
     };
     // SAFETY: plain data the call fills in.
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
@@ -295,12 +296,23 @@ fn keep_resident() {
     if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
         return;
     }
+    // `K6_HARD_WORKING_SET` (on; `=0`: the soft minimum as before). A soft
+    // minimum is only a hint: a page-fault trace (xperf, 12 s in the world,
+    // 2026-11-27) found 408,000 faults in victory.exe, two thirds of them
+    // transition faults (pages Windows had trimmed to its standby list), and
+    // 190,000 of those in `victory_safe_copy_at` reading title memory. A hard
+    // minimum keeps that many bytes in the working set: by default all of
+    // physical memory but 10 GB (never less than half), lowered in steps of
+    // 2 GB if the system refuses.
+    let hard = std::env::var_os("K6_HARD_WORKING_SET").is_none_or(|v| v != "0");
     let mut want = match std::env::var("K6_MIN_WORKING_SET_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
         Some(0) => return,
         Some(mb) => mb << 20,
+        None if hard => m.ullTotalPhys.saturating_sub(10 << 30).max(m.ullTotalPhys / 2),
         None => m.ullTotalPhys / 2,
     };
     let max = m.ullTotalPhys;
+    let flags = if hard { QUOTA_LIMITS_HARDWS_MIN_ENABLE } else { QUOTA_LIMITS_HARDWS_MIN_DISABLE };
     while want >= 1 << 30 {
         // SAFETY: a plain process setting.
         let ok = unsafe {
@@ -308,14 +320,14 @@ fn keep_resident() {
                 GetCurrentProcess(),
                 want as usize,
                 max as usize,
-                QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE,
+                flags | QUOTA_LIMITS_HARDWS_MAX_DISABLE,
             )
         } != 0;
         if ok {
-            tracing::info!(min_mb = want >> 20, "a soft minimum working set (K6_MIN_WORKING_SET_MB=0: none)");
+            tracing::warn!(min_mb = want >> 20, hard, "a minimum working set (K6_MIN_WORKING_SET_MB=0: none; K6_HARD_WORKING_SET=0: soft)");
             return;
         }
-        want /= 2;
+        want = want.saturating_sub(2 << 30).min(want / 4 * 3);
     }
     tracing::warn!("the system refused a minimum working set of 1 GB or more");
 }

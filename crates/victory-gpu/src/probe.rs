@@ -524,12 +524,17 @@ fn open_file() -> Option<BufWriter<File>> {
     Some(file)
 }
 
-/// Every 5 s (2 s for the overlay alone): the threads' processor time since
+/// Every 30 s (2 s for the overlay alone): the threads' processor time since
 /// the last look, the busiest kept for the rows and the overlay, the
 /// busiest ten logged when the file is on.
 fn look_at_threads(out: &mut Out, now: Instant, file: bool) {
     let wall = now.duration_since(out.threads_at).as_secs_f64();
-    if wall < if file { 5.0 } else { 2.0 } {
+    // A thread snapshot maps a system-wide list (~32 MB of fresh pages each
+    // time: 21,600 demand-zero faults in 12 s in a fault trace), so the file
+    // looks every 30 s (`K6_PROBE_THREADS_S`), the overlay every 2 s.
+    static EVERY: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    let every = *EVERY.get_or_init(|| std::env::var("K6_PROBE_THREADS_S").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(30.0));
+    if wall < if file { every } else { 2.0 } {
         return;
     }
     out.threads_at = now;
