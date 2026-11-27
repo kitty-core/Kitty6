@@ -4032,7 +4032,36 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
 /// Raw twins ([`raw_twins`]) made since the last frame line, and those of them that
 /// do not begin on 16 bytes, as a raw view must ([`move_raw`]), and those of
 /// these that could not be moved there (null).
-pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Whether raw twins of buffer views that do not begin on 16 bytes begin at
+/// the view's own dword (`VICTORY_TWIN_EXACT`: on by default on an AMD card,
+/// off elsewhere; `1` forces it, `0` turns it off: a null view, as before,
+/// unless [`move_raw`] can move a staged one). Read once.
+///
+/// Off by default on other cards: such a view is outside what D3D12 allows
+/// ([`buffer_view_ok`] refuses raw views off 16 bytes), and an NVIDIA card's
+/// reading of one is not measured; a twin read from the 16 bytes below would
+/// give shifted data where the null view gives zeros.
+///
+/// D3D12 asks raw views to begin on 16 bytes; AMD's hardware and RADV read a
+/// raw buffer from any dword. Null, such a twin read zeros: the tree culling
+/// (`InstanceCulling:CS_Tree_BatchCull`) runs in two dispatches a frame, and
+/// the second one's batch list begins right after the first one's 4-byte
+/// entries, so in every frame whose split left it off 16 bytes the second
+/// dispatch read a list of zeros and its trees were not drawn: whole trees
+/// and palms dropped out for single frames while the camera moved (the
+/// "Just Like Paradise" title shot, frames 1 and 2 of capture title3; up to
+/// 1,000 such twins a frame in play). With the twins exact: 0 flicker frames
+/// (run titleTX).
+fn twin_exact(device: &ID3D12Device) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_TWIN_EXACT") {
+        Some(v) if v == "1" => true,
+        Some(v) if v == "0" => false,
+        _ => crate::indirect::amd(device),
+    })
+}
 
 /// Moves the raw view at `at`, a slot of our heaps the card does not see,
 /// which shows `bytes` from `start` on (GPU address), `by` bytes on: for a
@@ -4184,7 +4213,15 @@ fn buffer_srv(
                     .CreateShaderResourceView(&shadow.buffer, Some(&desc), twin);
                 shadow.buffer.GetGPUVirtualAddress() + first * 4
             };
-            if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
+            if by > 0 && twin_exact(&host.device) {
+                // The raw twin from the view's own first dword (on 4 bytes, not
+                // 16), not a null view ([`twin_exact`]).
+                TWINS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                desc.Anonymous.Buffer.FirstElement = first + u64::from(by / 4);
+                desc.Anonymous.Buffer.NumElements = count - by / 4;
+                // SAFETY: a live buffer and a slot of our heap.
+                unsafe { host.device.CreateShaderResourceView(&shadow.buffer, Some(&desc), twin) };
+            } else if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
                 TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 null_buffer_view(twin);
             }
@@ -4308,7 +4345,15 @@ fn buffer_uav(
                     .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), twin);
                 shadow.buffer.GetGPUVirtualAddress() + first * 4
             };
-            if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
+            if by > 0 && twin_exact(&host.device) {
+                // The raw twin from the view's own first dword (on 4 bytes, not
+                // 16), not a null view ([`twin_exact`]).
+                TWINS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                desc.Anonymous.Buffer.FirstElement = first + u64::from(by / 4);
+                desc.Anonymous.Buffer.NumElements = count - by / 4;
+                // SAFETY: a live buffer and a slot of our heap.
+                unsafe { host.device.CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), twin) };
+            } else if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
                 TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 null_buffer_view(twin);
             }
