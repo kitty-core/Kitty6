@@ -87,6 +87,11 @@ if ($Lean) {
     # -More @{K6_WINDOW_NO_CPU_SIDE='0'; VICTORY_CARD_WINDOWS_MB='1024'} for the old setup.
     $settings.VICTORY_CARD_BUFFERS_MB = '1536'; $settings.VICTORY_CARD_WINDOWS_MB = '2048'
     $settings.K6_WINDOW_NO_CPU_SIDE = '1'
+    # Buffers' copies on the card the title filled once and no shader writes let their CPU side
+    # go after 30 s (K6_BUFFER_NO_CPU_SIDE; the census counted 1.2 GB of such sides), and spare
+    # upload memory for sends not taken for 10 s is let go (K6_SEND_SPARE_S).
+    # -More @{K6_BUFFER_NO_CPU_SIDE='0'; K6_SEND_SPARE_S='0'} for the old setup.
+    $settings.K6_BUFFER_NO_CPU_SIDE = '1'; $settings.K6_SEND_SPARE_S = '10'
     # Upstream's renderer patches 1, 2, 5, 6 and 7, its best measured setup on the Series S
     # profile (README: 44.9 ms a frame, run merge-5).
     $settings.VICTORY_PORT_CONSTANTS = '1'; $settings.VICTORY_PORT_DESCRIPTORS = '1'
