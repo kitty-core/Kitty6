@@ -269,6 +269,24 @@ fn pools() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL").is_none_or(|v| v != "0"))
 }
 
+/// Whether a submitted title list is left without a host list until the
+/// title resets it, and takes one then (`K6_HOST_AT_RESET=0`: it is given a
+/// new, closed one at its submission, as before).
+///
+/// Why: every host list holds a command allocator, and the driver keeps
+/// command memory once made (measured on the 4070, `host::tests::
+/// allocator_memory`: 0.6 MB a fresh allocator, more as it records; a
+/// destroyed allocator's memory stays the process's for later ones). Given
+/// one at submission, each of the title's ~630 lists held an allocator
+/// while it waited for its reset, beside those in flight and the idle ones:
+/// 1,501 host lists were made in one run. Taken at the reset, a host list is
+/// held only from the reset to the submission.
+#[cfg(windows)]
+fn host_at_reset() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("K6_HOST_AT_RESET").is_none_or(|v| v != "0"))
+}
+
 /// A host list open for recording: one that has run, as a title's list is
 /// after its reset, or a new one.
 #[cfg(windows)]
@@ -424,16 +442,10 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(host) = list.host.replace(fresh) else {
+        let Some(host) = take_host(list) else {
             continue;
         };
         let earlier = std::mem::take(&mut list.earlier);
@@ -481,6 +493,21 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
     parts
 }
 
+/// The host side of a submitted title list, taken from it: with
+/// [`host_at_reset`] the list has none until its reset, else it is given a
+/// new, closed one for that reset.
+#[cfg(windows)]
+fn take_host(list: &mut List) -> Option<crate::host::HostList> {
+    if host_at_reset() {
+        return list.host.take();
+    }
+    let fresh = fresh_list()?;
+    // A new host list is open; the title's next call on its list is a
+    // reset, which wants it closed.
+    fresh.close();
+    list.host.replace(fresh)
+}
+
 /// Takes the host sides of submitted lists (each once, however often the
 /// submission names it) and leaves each list a new, closed host list for
 /// its next reset: what was taken, and which of them run in what order.
@@ -496,17 +523,11 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let (host, uploads, state) = unsafe {
-            let Some(host) = (*list).host.replace(fresh) else {
+            let Some(host) = take_host(&mut *list) else {
                 continue;
             };
             let uploads =
@@ -627,11 +648,17 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list() {
-            Ok(list) => Some(list),
-            Err(e) => {
-                tracing::warn!(error = %e, "no host command list");
-                None
+        host: crate::host::host().filter(|_| !thin).and_then(|h| {
+            // An idle host list is open and reset, as a new one is.
+            if host_at_reset() {
+                return fresh_list();
+            }
+            match h.new_list() {
+                Ok(list) => Some(list),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no host command list");
+                    None
+                }
             }
         }),
         #[cfg(windows)]
@@ -705,6 +732,14 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         list.earlier.clear();
         list.gate.clear();
+        // Submitted with [`host_at_reset`]: the list takes a host list now,
+        // one that has run and was reset or a new one, open either way.
+        if list.host.is_none() && host_at_reset() && let Some(fresh) = fresh_list() {
+            list.host = Some(fresh);
+            with_state(this, |_, state| state.reset(pipeline));
+            crate::pipeline::bound(pipeline);
+            return S_OK;
+        }
     }
     #[cfg(windows)]
     with_state(this, |host, state| {

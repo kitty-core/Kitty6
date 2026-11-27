@@ -1147,6 +1147,111 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// What command allocators and lists cost in private memory on the
+    /// host GPU: made, grown by a large recording, reset, and renewed. Run
+    /// with `cargo test --profile diag -p victory-gpu --features diagnostics
+    /// --lib -- --ignored --nocapture allocator_memory`.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    #[ignore = "measurement"]
+    fn allocator_memory() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = super::host() else { return };
+        const N: usize = 200;
+        let mb = |a: u64, b: u64| (b as i64 - a as i64) as f64 / (1 << 20) as f64;
+        let p0 = super::private_bytes();
+        let mut pairs: Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> = (0..N)
+            .map(|_| unsafe {
+                let a: ID3D12CommandAllocator =
+                    host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let l: ID3D12GraphicsCommandList =
+                    host.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &a, None).unwrap();
+                (a, l)
+            })
+            .collect();
+        let p1 = super::private_bytes();
+        println!("made {N}: {:.2} MB each", mb(p0, p1) / N as f64);
+        for commands in [1_000usize, 10_000, 50_000] {
+            let before = super::private_bytes();
+            for (a, l) in &pairs {
+                unsafe {
+                    l.Close().unwrap();
+                    a.Reset().unwrap();
+                    l.Reset(a, None).unwrap();
+                    for i in 0..commands {
+                        l.OMSetStencilRef(i as u32);
+                        l.OMSetBlendFactor(Some(&[i as f32; 4]));
+                        l.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY(1 + (i % 4) as i32));
+                    }
+                }
+            }
+            let after = super::private_bytes();
+            println!("{commands} x2 commands recorded in each: {:.2} MB each more", mb(before, after) / N as f64);
+        }
+        let before = super::private_bytes();
+        for (a, l) in &pairs {
+            unsafe {
+                l.Close().unwrap();
+                a.Reset().unwrap();
+                l.Reset(a, None).unwrap();
+            }
+        }
+        println!("reset, empty: {:.2} MB each", mb(before, super::private_bytes()) / N as f64);
+        let before = super::private_bytes();
+        for (a, l) in &mut pairs {
+            unsafe {
+                l.Close().unwrap();
+                let fresh: ID3D12CommandAllocator =
+                    host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                l.Reset(&fresh, None).unwrap();
+                *a = fresh;
+            }
+        }
+        println!("allocators renewed: {:.2} MB each", mb(before, super::private_bytes()) / N as f64);
+        let before = super::private_bytes();
+        drop(pairs);
+        println!("all dropped: {:.2} MB each", mb(before, super::private_bytes()) / N as f64);
+        println!("total since start: {:.1} MB", mb(p0, super::private_bytes()));
+        // Made again after the drop: does the driver hand back what it kept?
+        let before = super::private_bytes();
+        let again: Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> = (0..N)
+            .map(|_| unsafe {
+                let a: ID3D12CommandAllocator =
+                    host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let l: ID3D12GraphicsCommandList =
+                    host.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &a, None).unwrap();
+                for i in 0..50_000usize {
+                    l.OMSetStencilRef(i as u32);
+                    l.OMSetBlendFactor(Some(&[i as f32; 4]));
+                }
+                (a, l)
+            })
+            .collect();
+        println!("made again and grown: {:.2} MB each", mb(before, super::private_bytes()) / N as f64);
+        drop(again);
+        // Allocators alone, then lists sharing one allocator.
+        let before = super::private_bytes();
+        let allocators: Vec<ID3D12CommandAllocator> = (0..N * 2)
+            .map(|_| unsafe { host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap() })
+            .collect();
+        let mid = super::private_bytes();
+        let lists: Vec<ID3D12GraphicsCommandList> = (0..N * 2)
+            .map(|_| unsafe {
+                let l: ID3D12GraphicsCommandList =
+                    host.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocators[0], None).unwrap();
+                l.Close().unwrap();
+                l
+            })
+            .collect();
+        println!(
+            "allocator alone {:.2} MB, list alone {:.2} MB",
+            mb(before, mid) / (2 * N) as f64,
+            mb(mid, super::private_bytes()) / (2 * N) as f64
+        );
+        drop((allocators, lists));
+        println!("total at the end: {:.1} MB", mb(p0, super::private_bytes()));
+    }
+
     /// A list of ours is found by its name, with the debug layer's note or not.
     #[cfg(feature = "diagnostics")]
     #[test]
@@ -1321,7 +1426,9 @@ pub(crate) struct HostList {
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
-    prelude: OnceLock<Option<Prelude>>,
+    /// With [`prelude_pool`] taken from [`PRELUDES`] when the list first
+    /// needs one after a reset, and given back at its next reset.
+    prelude: Mutex<Option<Prelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: std::sync::Arc<Mutex<std::collections::BTreeSet<String>>>,
     /// What its indirect executions ran, for the report of a removed device.
@@ -1373,6 +1480,31 @@ fn lazy_prelude() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_PRELUDE").is_none_or(|v| v != "0"))
 }
+
+/// Whether preludes are shared: a list takes one from [`PRELUDES`] when it
+/// needs one and gives it back at its reset, when its submissions have run
+/// (`K6_PRELUDE_POOL=0`: a list keeps the one it made for its life, as
+/// before). Each prelude is a command allocator, 0.6 MB of driver memory
+/// the process keeps (`tests::allocator_memory`); 1,088 were made in a run
+/// that made 1,501 host lists, most of them idle at any time. Shared, there
+/// are about as many as lists in flight with transitions.
+fn prelude_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| lazy_prelude() && std::env::var_os("K6_PRELUDE_POOL").is_none_or(|v| v != "0"))
+}
+
+/// A prelude no list holds; nothing of it is executing.
+struct IdlePrelude(Prelude);
+
+// SAFETY: D3D12 objects are free-threaded, and an idle prelude is touched by
+// nobody until it is taken out again.
+unsafe impl Send for IdlePrelude {}
+
+/// Preludes given back at their lists' resets ([`prelude_pool`]).
+static PRELUDES: Mutex<Vec<IdlePrelude>> = Mutex::new(Vec::new());
+
+/// The most preludes kept idle in [`PRELUDES`]; more are let go.
+const PRELUDES_MOST: usize = 256;
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
@@ -4377,10 +4509,7 @@ impl Host {
                 &allocator,
                 None,
             )?;
-            let prelude = OnceLock::new();
-            if !lazy_prelude() {
-                let _ = prelude.set(self.make_prelude());
-            }
+            let prelude = Mutex::new(if lazy_prelude() { None } else { self.make_prelude() });
             #[cfg(feature = "diagnostics")]
             let notes = std::sync::Arc::<Mutex<Vec<Note>>>::default();
             let pipelines = std::sync::Arc::<Mutex<std::collections::BTreeSet<String>>>::default();
@@ -6743,6 +6872,16 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
+        // Every submission of the list has run, its prelude's too: another
+        // list may take that.
+        if prelude_pool()
+            && let Some(prelude) = self.prelude.lock().unwrap_or_else(|e| e.into_inner()).take()
+        {
+            let mut idle = PRELUDES.lock().unwrap_or_else(|e| e.into_inner());
+            if idle.len() < PRELUDES_MOST {
+                idle.push(IdlePrelude(prelude));
+            }
+        }
         let mut allocator = self.allocator.lock().unwrap_or_else(|e| e.into_inner());
         // An allocator keeps the memory of the largest recording it held:
         // now and then a fresh one is made instead, so one large frame does
@@ -7113,11 +7252,17 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() {
             return None;
         }
-        let Some((allocator, list)) = self
-            .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
-            .as_ref()
-        else {
+        let mut held = self.prelude.lock().unwrap_or_else(|e| e.into_inner());
+        if held.is_none() {
+            let idle = prelude_pool()
+                .then(|| PRELUDES.lock().unwrap_or_else(|e| e.into_inner()).pop())
+                .flatten();
+            *held = match idle {
+                Some(IdlePrelude(prelude)) => Some(prelude),
+                None => host().and_then(|h| h.make_prelude()),
+            };
+        }
+        let Some((allocator, list)) = held.as_ref() else {
             fail(format_args!("no host list for a state prelude"));
         };
         // SAFETY: the prelude is not executing (every submission is waited
