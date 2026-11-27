@@ -8,42 +8,25 @@ pub(in super::super) fn accesses_lds(inst: &Inst) -> bool {
 }
 
 pub(in super::super) fn supports_paired_lds(name: &str) -> bool {
-    matches!(
-        name,
-        "ds_read_b32"
-            | "ds_write_b32"
-            | "ds_read2_b32"
-            | "ds_write2_b32"
-            | "ds_read2st64_b32"
-            | "ds_write2st64_b32"
-    ) || lds_rmw(name).is_some()
+    matches!(name, "ds_read_b32" | "ds_write_b32" | "ds_read2_b32" | "ds_write2_b32") || paired_rmw(name).is_some()
 }
 
-/// A dword LDS atomic the paired form takes: its operation, and whether it returns the old
-/// value. (Kitty6: the order-free atomics, their returning forms and `ds_wrxchg_rtn_b32`
-/// besides #1397's `ds_min_u32` / `ds_max_u32`; each host lane takes the lower console lane's
-/// atomic, then the upper one's.)
-fn lds_rmw(name: &str) -> Option<(Rmw, bool)> {
-    let op = name.strip_prefix("ds_")?;
-    let (op, rtn) = match op.strip_suffix("_rtn_u32").or_else(|| op.strip_suffix("_rtn_i32")).or_else(|| op.strip_suffix("_rtn_b32")) {
-        Some(op) => (op, true),
-        None => (op.strip_suffix("_u32").or_else(|| op.strip_suffix("_i32")).or_else(|| op.strip_suffix("_b32"))?, false),
-    };
-    let signed = name.ends_with("_i32");
-    let rmw = match op {
-        "add" => Rmw::Add,
-        "sub" => Rmw::Sub,
-        "and" => Rmw::And,
-        "or" => Rmw::Or,
-        "xor" => Rmw::Xor,
-        "min" if signed => Rmw::Min,
-        "max" if signed => Rmw::Max,
-        "min" if name.ends_with("_u32") => Rmw::UMin,
-        "max" if name.ends_with("_u32") => Rmw::UMax,
-        "wrxchg" if rtn => Rmw::Xchg,
+/// The LDS atomics without a returned value the paired form takes: each lane's is a host
+/// atomic of its own, and these integer operations give the same dword in any order
+/// (`ds_add_u32`: the depth scan's counters, CS_ScanMip0..3).
+fn paired_rmw(name: &str) -> Option<Rmw> {
+    Some(match name {
+        "ds_min_u32" => Rmw::UMin,
+        "ds_max_u32" => Rmw::UMax,
+        "ds_min_i32" => Rmw::Min,
+        "ds_max_i32" => Rmw::Max,
+        "ds_add_u32" => Rmw::Add,
+        "ds_sub_u32" => Rmw::Sub,
+        "ds_and_b32" => Rmw::And,
+        "ds_or_b32" => Rmw::Or,
+        "ds_xor_b32" => Rmw::Xor,
         _ => return None,
-    };
-    Some((rmw, rtn))
+    })
 }
 
 impl<'a> Lower<'a> {
@@ -55,18 +38,15 @@ impl<'a> Lower<'a> {
         if !supports_paired_lds(name) {
             return Err("an LDS operation not supported by paired Wave64");
         }
-        let pair = matches!(name, "ds_read2_b32" | "ds_write2_b32" | "ds_read2st64_b32" | "ds_write2st64_b32");
-        let scale = if name.contains("st64") { 256 } else { 4 };
+        let pair = matches!(name, "ds_read2_b32" | "ds_write2_b32");
         let offsets = if pair {
-            [u32::from(*offset0) * scale, u32::from(*offset1) * scale]
+            [u32::from(*offset0) * 4, u32::from(*offset1) * 4]
         } else {
             [u32::from(*offset0) | u32::from(*offset1) << 8, 0]
         };
-        let rmw = lds_rmw(name);
-        let returns = rmw.is_some_and(|(_, rtn)| rtn);
-        let rmw = rmw.map(|(op, _)| op);
         let read = name.starts_with("ds_read");
-        let dst = if read || returns {
+        let rmw = paired_rmw(name);
+        let dst = if read {
             let Some(Operand::Vector { reg, .. }) = dst else {
                 return Err("an LDS result");
             };
@@ -91,13 +71,7 @@ impl<'a> Lower<'a> {
             let ptr = self.s.m.element(self.cur, lds, index);
             if let Some(value) = value {
                 if let Some(op) = rmw {
-                    let old = self.s.m.atomic(self.cur, op, ptr, value);
-                    if returns {
-                        let zero = self.s.m.i32(0);
-                        let old = self.end_guarded(join, &[(old, zero)])[0];
-                        self.write(inst, Reg::V(dst.ok_or("an LDS result")?), old, guard);
-                        continue;
-                    }
+                    self.s.m.atomic(self.cur, op, ptr, value);
                 } else {
                     self.s.m.store(self.cur, ptr, value);
                 }
@@ -324,11 +298,40 @@ impl<'a> Lower<'a> {
                 true => self.sections[&b][&start].shapes.get(&w).copied(),
                 false => None,
             };
+            // A value that leaves the section with no shape but that nothing after it sees
+            // (a reduction's scratch partial sums, which the next tree overwrites in every
+            // lane before reading: [`super::paired_fp32::unseen_after`]): any value will do.
+            // This line's IR names a register's old value as read by every write to it, so
+            // without this the next section's replay reads a missing value (5dc3b25986622949:
+            // the FP64 count's partial sums in v2-v5, then the FP32 count s15).
+            if shape.is_none()
+                && self.section_out.contains(&w)
+                && let Some(&(reg, _)) = inst.writes.iter().find(|x| x.1 == w)
+                && super::paired_fp32::unseen_after(
+                    self.x.p,
+                    &self.sections,
+                    (b, start, self.sections[&b][&start].end),
+                    reg,
+                    w,
+                )
+            {
+                let z = self.s.m.i32(0);
+                self.put_lanes(w, Val::I32(z), Val::I32(z));
+                continue;
+            }
+            if shape.is_none() && self.section_out.contains(&w) && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                eprintln!(
+                    "WAVE64-PAIRS {} at {:#x} leaves {w:?} unknown and seen later",
+                    inst.name(),
+                    inst.machine.offset
+                );
+            }
             let made = match shape {
                 None => Err(UNKNOWN),
-                Some(sh @ (Shape::Active(..) | Shape::Prefix(..) | Shape::ActiveF64(..))) => {
-                    self.paired_shape(sh)
+                Some(Shape::ActiveF64(lo, hi, mask, high)) => {
+                    self.paired_f64_constant_sum(b, start, lo, hi, mask, high)
                 }
+                Some(sh @ (Shape::Active(..) | Shape::Prefix(..))) => self.paired_shape(sh),
                 Some(sh) => self.both(|l| l.shape(sh, false)),
             };
             match made {
@@ -336,6 +339,67 @@ impl<'a> Lower<'a> {
                 Err(why) => self.put_lanes(w, Val::Missing(why), Val::Missing(why)),
             }
         }
+    }
+
+    /// A section's 64-bit float sum over the console wave whose every term is one constant
+    /// with exact sums ([`super::paired_fp32::exact_f64_term`]): the number of lanes in the
+    /// mask, both lanes of every thread, times the constant; +0.0 for none. Any other paired
+    /// FP64 sum is refused: its additions round, so their order counts.
+    fn paired_f64_constant_sum(
+        &mut self,
+        b: usize,
+        start: usize,
+        lo: Value,
+        hi: Value,
+        mask: Value,
+        high: bool,
+    ) -> Result<[V; 2], Why> {
+        use super::super::wave::Op;
+        let term = super::paired_fp32::exact_f64_term(self.x.p, b, start, lo, hi)
+            .ok_or("a paired FP64 reduction")?;
+        let &m = self
+            .x
+            .st
+            .masks
+            .get(&mask)
+            .ok_or("a wave reduction's untracked mask")?;
+        let c = self.cur;
+        let [lo_on, hi_on] = self.both(|l| {
+            let on = l.boolean(m, c)?;
+            let (one, zero) = (l.s.m.i32(1), l.s.m.i32(0));
+            Ok(l.s.m.select(c, on, one, zero))
+        })?;
+        self.s.flags |= flags::WAVE_OPS;
+        let lo_n = self.host_wave_op(Op::AddU, lo_on, false, None)?;
+        let hi_n = self.host_wave_op(Op::AddU, hi_on, false, None)?;
+        let n = self.s.m.bin(c, Bin::Add, lo_n, hi_n);
+        let zero = self.s.m.i32(0);
+        if term == 0 {
+            return Ok([zero, zero]);
+        }
+        self.s.flags |= flags::DOUBLES;
+        let f64t = self.s.m.double();
+        let i32t = self.s.t.i32;
+        let split_ty = self
+            .s
+            .m
+            .named_struct("dx.types.splitdouble", vec![i32t, i32t]);
+        let (klo, khi) = (self.s.m.i32(term as u32), self.s.m.i32((term >> 32) as u32));
+        let k = self
+            .s
+            .op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[klo, khi]);
+        let f32t = self.s.t.f32;
+        let count = self.s.m.cast(c, Cast::SiToFp, n, f32t);
+        let count = self.s.m.cast(c, Cast::FpExt, count, f64t);
+        // (exact: n is at most 64 and the term has at most 47 significant bits)
+        let sum = self.s.m.bin(c, Bin::Mul, count, k);
+        let split = self
+            .s
+            .op(c, "splitDouble.f64", Attr::ReadNone, split_ty, 102, &[sum]);
+        let word = self.s.m.extract(c, split, u32::from(high));
+        let none = self.s.m.cmp(c, pred::EQ, n, zero);
+        let r = self.s.m.select(c, none, zero, word);
+        Ok([r, r])
     }
 
     /// The first `steps` levels of [`Self::half_sum`]'s tree over this host wave: its lanes'
@@ -479,10 +543,7 @@ impl<'a> Lower<'a> {
     fn paired_shape(&mut self, shape: super::super::wave::Shape) -> Result<[V; 2], Why> {
         use super::super::wave::{Op, Shape};
         let (op, src, mask, ident, prefix) = match shape {
-            Shape::ActiveF64(lo, hi, mask, high) => {
-                let r = self.paired_f64_sum(lo, hi, mask, high)?;
-                return Ok([r, r]);
-            }
+            Shape::ActiveF64(..) => return Err("a paired FP64 reduction"),
             Shape::Prefix(Op::AddF | Op::AddH | Op::MinF | Op::MaxF, ..) => {
                 return Err("a paired floating-point prefix");
             }
@@ -514,15 +575,9 @@ impl<'a> Lower<'a> {
             let r = self.join_half_sums(lo, hi);
             return Ok([r, r]);
         }
-        // A float reduction the ordered replay did not take ([`Self::replay_paired_fp32`]: its
-        // guest mode not confirmed, `VICTORY_WAVE_PAIRS_FP32`): each half reduced by the host
-        // wave and the two joined, as PR 854 (Pilote Production, 8079c9dc) does. The sum's
-        // order differs from the console's tree, so its last bits may too.
-        let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
-        if float && prefix.is_some() {
-            return Err("a paired floating-point prefix");
+        if matches!(op, Op::AddF | Op::MinF | Op::MaxF) {
+            return Err("a floating-point reduction without an exact paired tree");
         }
-        let (lo, hi) = if float { (self.as_float(lo), self.as_float(hi)) } else { (lo, hi) };
         let r = match prefix {
             Some(inclusive) => {
                 let mine = self.host_wave_op(op, lo, false, Some(inclusive))?;
@@ -531,63 +586,12 @@ impl<'a> Lower<'a> {
                 [mine, self.s.m.bin(c, Bin::Add, theirs, below)]
             }
             None => {
-                let lo = self.host_wave_op(op, lo, float, None)?;
-                let hi = self.host_wave_op(op, hi, float, None)?;
-                let r = self.join_halves(op, lo, hi, float);
-                let r = if float { self.as_int(r) } else { r };
+                let lo = self.host_wave_op(op, lo, false, None)?;
+                let hi = self.host_wave_op(op, hi, false, None)?;
+                let r = self.join_halves(op, lo, hi, false);
                 [r, r]
             }
         };
         Ok(r)
     }
-
-    /// A 64-bit float wave sum (`Shape::ActiveF64`: the water volumetrics' sums of doubles) in
-    /// the paired form: each half summed by the host wave, the lower lanes' and the upper
-    /// lanes', and the two added, as two exchanging host waves add theirs
-    /// (`Self::active_f64_sum`); after PR 854's (Pilote Production, 8079c9dc) `float64.rs`.
-    /// The dword `high` of the sum.
-    fn paired_f64_sum(&mut self, lo: Value, hi: Value, mask: Value, high: bool) -> Result<V, Why> {
-        let &m = self
-            .x
-            .st
-            .masks
-            .get(&mask)
-            .ok_or("a wave reduction's untracked mask")?;
-        let c = self.cur;
-        let f64t = self.s.m.double();
-        let halves = self.both(|l| {
-            let on = l.boolean(m, c)?;
-            let on = l.launched(c, on, mask);
-            let (lo, hi) = (l.i32_of(lo)?, l.i32_of(hi)?);
-            let z = l.s.m.i32(0);
-            let (lo, hi) = (l.s.m.select(c, on, lo, z), l.s.m.select(c, on, hi, z));
-            Ok(l.s.op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo, hi]))
-        })?;
-        self.s.flags |= flags::WAVE_OPS | flags::DOUBLES;
-        let (k0, k0b) = (self.s.m.i8(0), self.s.m.i8(0));
-        let [lower, upper] = halves.map(|d| {
-            self.s.op(c, "waveActiveOp.f64", Attr::NoUnwind, f64t, 119, &[d, k0, k0b])
-        });
-        let total = self.s.m.bin(c, Bin::Add, lower, upper);
-        let i32t = self.s.t.i32;
-        let split_ty = self.s.m.named_struct("dx.types.splitdouble", vec![i32t, i32t]);
-        let split = self.s.op(c, "splitDouble.f64", Attr::ReadNone, split_ty, 102, &[total]);
-        Ok(self.s.m.extract(c, split, u32::from(high)))
-    }
-}
-
-#[cfg(test)]
-#[test]
-fn the_paired_form_takes_dword_lds_atomics() {
-    assert_eq!(lds_rmw("ds_add_u32"), Some((Rmw::Add, false)));
-    assert_eq!(lds_rmw("ds_add_rtn_u32"), Some((Rmw::Add, true)));
-    assert_eq!(lds_rmw("ds_or_b32"), Some((Rmw::Or, false)));
-    assert_eq!(lds_rmw("ds_min_u32"), Some((Rmw::UMin, false)));
-    assert_eq!(lds_rmw("ds_max_i32"), Some((Rmw::Max, false)));
-    assert_eq!(lds_rmw("ds_wrxchg_rtn_b32"), Some((Rmw::Xchg, true)));
-    assert_eq!(lds_rmw("ds_wrxchg_b32"), None, "no exchange that drops the old value");
-    assert_eq!(lds_rmw("ds_cmpst_rtn_b32"), None);
-    assert_eq!(lds_rmw("ds_read_b32"), None);
-    assert!(supports_paired_lds("ds_read2st64_b32") && supports_paired_lds("ds_write2st64_b32"));
-    assert!(!supports_paired_lds("ds_read_u16") && !supports_paired_lds("ds_write_b16"));
 }
