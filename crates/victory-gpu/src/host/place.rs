@@ -240,7 +240,10 @@ impl HostList {
         let Some(host) = host() else {
             return false;
         };
-        let Some(to) = crate::shadow::peek(dst as u64, len as u64).filter(|s| !s.in_place()) else {
+        // A window with no CPU side (`K6_WINDOW_NO_CPU_SIDE`) has nothing to
+        // bring a write at its place back by: done at submission, as before,
+        // and sent up from title memory.
+        let Some(to) = crate::shadow::peek(dst as u64, len as u64).filter(|s| !s.in_place() && !s.lean()) else {
             return false;
         };
         let own = shaders_own(src, len);

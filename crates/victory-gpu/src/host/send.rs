@@ -27,6 +27,13 @@ pub(super) fn own() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_OWN").is_none_or(|v| v != "0"))
 }
 
+/// Whether submissions' sends can be taken into memory of their own: the
+/// switch is on and the pass that stores pairs was made (without it
+/// [`take`] gives nothing).
+pub(crate) fn ready() -> bool {
+    own() && host().and_then(pass).is_some()
+}
+
 /// Runs up to this many bytes go as pairs.
 const SHORT: usize = 256;
 
@@ -193,22 +200,26 @@ pub(super) struct Own {
 /// Runs whose pairs are one piece of work.
 const RUNS_AT_A_TIME: usize = 4096;
 
-/// Takes what `dirty` sends up out of the CPU sides.
+/// Takes what `dirty` sends up out of the CPU sides; that of a window with no
+/// CPU side (`Shadow::lean`) out of title memory itself.
 pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
     let began = std::time::Instant::now();
     pass(host)?;
     // Runs of whole words of the copy: only those are pairs. (A byte beside
-    // them in a word may be the card's.)
-    let short = |&(a, b): &(usize, usize)| short(a, b - a);
+    // them in a word may be the card's.) Not of a window with no CPU side:
+    // its runs, read from title memory, go as copies.
+    let paired = |lean: bool, &(a, b): &(usize, usize)| !lean && short(a, b - a);
+    let short = |r: &(usize, usize)| paired(false, r);
     let mut at = 0u64;
     let mut copies = Vec::with_capacity(dirty.len());
-    for (_, ranges) in dirty {
+    for (shadow, ranges) in dirty {
+        let lean = shadow.lean();
         let mut runs = Vec::new();
-        for &(a, b) in ranges.iter().filter(|r| !short(r)) {
+        for &(a, b) in ranges.iter().filter(|r| !paired(lean, r)) {
             runs.push((a, at, b - a));
             at += ((b - a) as u64).next_multiple_of(16);
         }
-        let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
+        let words: usize = ranges.iter().filter(|r| paired(lean, r)).map(|r| (r.1 - r.0) / 4).sum();
         copies.push(Copy { runs, pairs: (at, words as u32) });
         at += (words as u64 * 8).next_multiple_of(16);
     }
@@ -217,8 +228,15 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     }
     let memory = memory(host, at)?;
     let mut moves: Vec<(usize, usize, usize)> = Vec::new();
+    let mut title_moves: Vec<(usize, usize, usize)> = Vec::new();
     let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
     for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
+        if shadow.lean() {
+            // (Its offsets are title addresses from its start on.)
+            let from = shadow.span().0 as usize;
+            title_moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
+            continue;
+        }
         let from = shadow.card_data() as usize;
         moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
         // (80,000 runs of some words a frame: in pieces of work.)
@@ -249,10 +267,11 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
         }
     };
     crate::land::each_under(work.len(), &one);
-    STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
-    STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
+    STATS[0].fetch_add(moves.iter().chain(&title_moves).map(|m| m.2 as u64).sum(), Ordering::Relaxed);
+    STATS[1].fetch_add((moves.len() + title_moves.len()) as u64, Ordering::Relaxed);
     STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
     crate::shadow::copy_all(moves);
+    crate::shadow::copy_title_all(title_moves);
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     Some(Own { memory, copies, used: at })
 }

@@ -4181,7 +4181,7 @@ mod place;
 pub(crate) mod rec;
 mod send;
 mod upq;
-pub(crate) use send::{goes_as_words, words_under};
+pub(crate) use send::{goes_as_words, ready as sends_ready, words_under};
 #[cfg(feature = "diagnostics")]
 pub(crate) mod spans;
 mod torn;
@@ -4847,6 +4847,17 @@ impl Host {
         let taking = crate::timeline::span("copies in the card's memory: taken");
         let own = if send::own() { send::take(self, &dirty) } else { None };
         taking.end();
+        // A window with no CPU side sends only through that memory: without
+        // it (none could be had) its ranges wait for the next submission.
+        if own.is_none() {
+            for (shadow, ranges) in dirty.iter().filter(|(s, r)| s.lean() && !r.is_empty()) {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| tracing::warn!("K6_WINDOW_NO_CPU_SIDE: no upload memory for a submission's sends; windows with no CPU side send later"));
+                for &(a, b) in ranges {
+                    shadow.resend(a, b);
+                }
+            }
+        }
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -4886,7 +4897,7 @@ impl Host {
                         let sides: Vec<_> = dirty.iter().map(|(shadow, _)| shadow.card_sides()).collect();
                         let mut ranges: Vec<upq::Range<'_>> = Vec::new();
                         for ((shadow, rs), side) in dirty.iter().zip(&sides) {
-                            if let Some((staging, _, _)) = side {
+                            if let Some((Some(staging), _, _)) = side {
                                 ranges.extend(rs.iter().map(|&(a, b)| (&shadow.buffer, a as u64, *staging, (b - a) as u64)));
                             }
                         }
@@ -4899,7 +4910,10 @@ impl Host {
                         let Some((staging, before, _)) = shadow.card_sides() else {
                             continue;
                         };
-                        if own.is_none() && up.is_none() {
+                        if own.is_none()
+                            && up.is_none()
+                            && let Some(staging) = staging
+                        {
                             for &(a, b) in ranges {
                                 list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
                             }

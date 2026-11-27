@@ -903,6 +903,20 @@ fn log_memory() {
         targets[8],
         mb(targets[9]),
     );
+    {
+        let sides = crate::shadow::window_sides();
+        tracing::info!(
+            "windows in the card's memory: {} with no CPU side {:.0} MB (not held in the PC's memory, K6_WINDOW_NO_CPU_SIDE), \
+             {} with a CPU side {:.0} MB (as much again in the PC's memory); {:.0} MB sent to the former straight from \
+             title memory since the start; {} shader writes declared for them and dropped",
+            sides[0],
+            mb(sides[1]),
+            sides[2],
+            mb(sides[3]),
+            mb(sides[4]),
+            sides[5],
+        );
+    }
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
          {:.0} MB; of the windows alive, {:.0} MB lie between the lowest and highest address \

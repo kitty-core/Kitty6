@@ -243,7 +243,8 @@ pub(crate) fn shown(views: Vec<(Arc<Shadow>, u64, u64)>, all: bool) {
     if all {
         state.shown.clear();
     }
-    for (copy, from, to) in views.into_iter().filter(|v| v.0.carded() && v.1 < v.2) {
+    // (A window with no CPU side cannot bring writes back: `Shadow::lean`.)
+    for (copy, from, to) in views.into_iter().filter(|v| v.0.carded() && !v.0.lean() && v.1 < v.2) {
         let e = state.shown.entry(copy.id()).or_insert_with(|| Shown {
             copy: Arc::downgrade(&copy),
             from,

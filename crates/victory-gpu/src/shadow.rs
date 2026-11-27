@@ -117,6 +117,14 @@ pub(crate) struct Shadow {
     /// went back to title memory, since the copy was made.
     #[cfg(feature = "diagnostics")]
     moved: [AtomicU64; 3],
+    /// A window in the card's memory with no CPU side
+    /// ([`window_no_cpu_side`]): `data` is null, `Card::staging` is `None`,
+    /// and what changed goes up straight from title memory.
+    lean: bool,
+    /// Of a `lean` window: shaders were declared to write it, which it cannot
+    /// bring back. The next ask for its memory makes a window with a CPU side
+    /// in its place ([`loose`]).
+    spoiled: std::sync::atomic::AtomicBool,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -124,8 +132,9 @@ pub(crate) struct Shadow {
 struct Card {
     /// The CPU's side, in the PC's memory: what `data` maps. Title memory
     /// is copied into it as into any copy, and what changed in it goes to
-    /// the card's side before the next submission.
-    staging: ID3D12Resource,
+    /// the card's side before the next submission. `None` for a window with
+    /// no CPU side ([`window_no_cpu_side`]).
+    staging: Option<ID3D12Resource>,
     /// The card side's bytes as they were when the submission's shaders
     /// started, in the card's memory too: made when shader writes are
     /// first declared for the copy, and compared with the card's side, on
@@ -564,7 +573,8 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
 /// [`reserve_card_budgets`], whose room was kept): textures keep their room,
 /// and once they have filled the card later windows stay where they are. The CPU's side stays in the PC's
 /// memory, so the memory shared with the card does not shrink by this
-/// alone; what moves is what shaders read.
+/// alone; what moves is what shaders read. With [`window_no_cpu_side`] a
+/// window on the card has no CPU side, and its bytes leave the PC's memory.
 fn window_card_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
@@ -645,6 +655,132 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
 fn windows_own() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOWS_OWN").is_some_and(|v| v == "1"))
+}
+
+/// Whether a window that goes to the card's own memory
+/// ([`window_card_most`]) keeps no CPU side in the PC's memory
+/// (`K6_WINDOW_NO_CPU_SIDE=1`; off by default).
+///
+/// A window on the card had two sides of its full size: the card's, which
+/// shaders read, and the CPU's (a shared buffer in RAM, private memory of the
+/// process), which title memory was copied into and the changed ranges went up
+/// from. With 1 GiB of windows on the card that is 1 GiB of RAM that only
+/// repeats title memory, which is in RAM already. What the CPU side is for, and
+/// what stands in for it here:
+///
+/// - Staging for the sends: with `VICTORY_SEND_OWN` (on by default) each
+///   submission's sends are taken into upload memory of its own anyway
+///   (`host::send::take`), given back after its fence. A lean window's dirty
+///   ranges are taken there straight from title memory instead (read as
+///   `crate::host::copy_mapped` reads: what is not mapped reads as zeros, as
+///   the refresh stored it). Without `VICTORY_SEND_OWN` no window is lean.
+/// - A reference to send only the dwords that changed: only memory the write
+///   watch does not cover needs one (`VICTORY_UNWATCHED_CHANGED`), so memory
+///   that is not watched when the window is made gets a CPU side as before.
+///   Watched memory sends the 64 KiB pages written since, whole, as a window
+///   with a CPU side does (`VICTORY_SEND_CHANGED` is off by default; with it
+///   on no window is lean). If the watch later fails, the whole range asked
+///   goes up each time.
+/// - The reference for shader writes (`card_merge*`, the landing, the bytes
+///   put in under declared writes, copies at their place in a list): no
+///   shader writes a window (run 91 and since). A copy of the title's into
+///   such a window is done at submission, on the CPU, as before
+///   `VICTORY_COPIES_IN_PLACE` (`host::place`), and goes up from title
+///   memory. Should a shader be declared to write one, it is said once in the
+///   log, the declaration is dropped (what it wrote stays on the card), and
+///   the next ask for that memory makes a window with a CPU side in its place.
+/// - Diagnostics that read the CPU side (`VICTORY_UPCOPY_CHECK`,
+///   `VICTORY_REFRESH_CHECK`): with the first no window is lean, the second
+///   skips lean windows.
+///
+/// Submissions in the air are not affected: they read the card's side, which
+/// only changes by the copies queued ahead of later submissions.
+///
+/// The memory line says how many windows are lean and what they hold
+/// ("windows in the card's memory: ... with no CPU side").
+fn window_no_cpu_side() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let asked = std::env::var_os("K6_WINDOW_NO_CPU_SIDE").is_some_and(|v| v == "1");
+        let on = asked && lean_possible(cards(), crate::host::sends_ready(), send_changed(), crate::host::upcheck::on());
+        if asked {
+            tracing::info!(on, "K6_WINDOW_NO_CPU_SIDE: windows in the card's memory keep no CPU side");
+        }
+        on
+    })
+}
+
+/// Whether windows can go without a CPU side under these switches
+/// ([`window_no_cpu_side`]). Pure.
+fn lean_possible(cards: bool, sends_own: bool, send_changed: bool, upcheck: bool) -> bool {
+    cards && sends_own && !send_changed && !upcheck
+}
+
+/// Lean windows alive and their bytes; bytes sent up from title memory to
+/// them since the start; declared writes dropped.
+static WINDOW_LEAN: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Starts of windows that were lean and that shaders were declared to write:
+/// made with a CPU side from then on.
+static LEAN_REFUSED: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// For the memory line: windows in the card's memory with no CPU side
+/// (count, bytes), with one (count, bytes), bytes sent to the former straight
+/// from title memory since the start, and shader writes declared for them and
+/// dropped.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn window_sides() -> [u64; 6] {
+    let lean = [0, 1].map(|i| WINDOW_LEAN[i].load(Ordering::Relaxed));
+    let (mut sided, mut sided_bytes) = (0, 0);
+    {
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        let mut seen = std::collections::HashSet::new();
+        for s in loose.values().filter(|s| seen.insert(Arc::as_ptr(s) as usize)) {
+            if s.card.is_some() && !s.lean {
+                sided += 1;
+                sided_bytes += s.len;
+            }
+        }
+    }
+    [lean[0], lean[1], sided, sided_bytes, WINDOW_LEAN[2].load(Ordering::Relaxed), WINDOW_LEAN[3].load(Ordering::Relaxed)]
+}
+
+/// Copies of title memory into memory of ours (from, to, bytes), each read
+/// as [`crate::host::copy_mapped`] reads (what is not mapped reads as zeros),
+/// on several threads if they are many: the sends of windows with no CPU
+/// side ([`window_no_cpu_side`]).
+pub(crate) fn copy_title_all(copies: Vec<(usize, usize, usize)>) {
+    const PART: usize = 256 << 10;
+    let bytes: usize = copies.iter().map(|c| c.2).sum();
+    if bytes == 0 {
+        return;
+    }
+    WINDOW_LEAN[2].fetch_add(bytes as u64, Ordering::Relaxed);
+    if bytes <= 1 << 20 {
+        for (src, dst, len) in copies {
+            crate::host::copy_mapped(dst as *mut u8, src as *const u8, len, false);
+        }
+        return;
+    }
+    let parts = title_parts(copies, PART);
+    wide_each(parts.len(), move |i| {
+        let (src, dst, len) = parts[i];
+        crate::host::copy_mapped(dst as *mut u8, src as *const u8, len, false);
+    });
+}
+
+/// `copies` (from, to, bytes) cut into pieces of at most `part` bytes. Pure.
+fn title_parts(copies: Vec<(usize, usize, usize)>, part: usize) -> Vec<(usize, usize, usize)> {
+    let mut parts = Vec::new();
+    for (src, dst, len) in copies {
+        let mut at = 0;
+        while at < len {
+            let n = part.min(len - at);
+            parts.push((src + at, dst + at, n));
+            at += n;
+        }
+    }
+    parts
 }
 
 /// [`window_card_for`] in the card's own memory.
@@ -775,7 +911,7 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let mut all: Vec<Arc<Shadow>> = buffers_read().values().filter_map(|e| e.shadow.clone()).collect();
     all.extend(LOOSE.read().unwrap_or_else(|e| e.into_inner()).values().cloned());
-    all.retain(|s| s.place.is_none() && s.watched.load(Ordering::Relaxed) == 1);
+    all.retain(|s| s.place.is_none() && !s.lean && s.watched.load(Ordering::Relaxed) == 1);
     all.sort_by_key(|s| s.id);
     let next = NEXT.load(Ordering::Relaxed);
     let turn = all.partition_point(|s| s.id < next);
@@ -2917,6 +3053,10 @@ impl Drop for Shadow {
         if self.mapped {
             WINDOW_MAPPED_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
+        if self.lean {
+            WINDOW_LEAN[0].fetch_sub(1, Ordering::Relaxed);
+            WINDOW_LEAN[1].fetch_sub(self.len, Ordering::Relaxed);
+        }
         let prints = self.prints.get_mut().unwrap_or_else(|e| e.into_inner()).len();
         if prints != 0 {
             crate::windowskip::prints_gone(prints);
@@ -3113,6 +3253,107 @@ mod landing_tests {
         copy.take_landed(from, to);
         assert_eq!(copy.take_dirty(), []);
         drop(room);
+    }
+}
+
+#[cfg(test)]
+mod lean_tests {
+    use super::{KERNEL_PAGE, PAGE, Shadow, copy_title_all, lean_possible, title_parts};
+
+    /// Windows go without a CPU side only where the sends are taken into
+    /// memory of their own, nothing compares dwords against a CPU side, and
+    /// no check reads it.
+    #[test]
+    fn lean_windows_need_own_sends_and_no_reference() {
+        assert!(lean_possible(true, true, false, false));
+        assert!(!lean_possible(false, true, false, false), "no copies on the card");
+        assert!(!lean_possible(true, false, false, false), "VICTORY_SEND_OWN=0");
+        assert!(!lean_possible(true, true, true, false), "VICTORY_SEND_CHANGED=1");
+        assert!(!lean_possible(true, true, false, true), "VICTORY_UPCOPY_CHECK=1");
+    }
+
+    /// A window with no CPU side reads nothing of one (its `data` is null:
+    /// a read or a write there would fault): every refresh path marks what
+    /// it took to go up, and what would compare or merge against a CPU side
+    /// does nothing.
+    #[test]
+    fn a_window_with_no_cpu_side_marks_what_it_takes_and_touches_no_cpu_side() {
+        const PAGES: usize = 4;
+        let room = vec![5u8; (PAGES + 1) * PAGE];
+        let title = room.as_ptr() as usize;
+        let title = title.next_multiple_of(KERNEL_PAGE);
+        let len = PAGES * PAGE;
+        let copy = Shadow::unbacked_lean(title as u64, len as u64);
+        assert!(copy.lean() && copy.carded());
+        assert!(copy.card_sides().is_some_and(|(staging, before, size)| staging.is_none() && before.is_none() && size == len as u64));
+        // Taken whole, in part, compared or not: marked, nothing read.
+        copy.copy(title + 100, title + PAGE + 7);
+        assert_eq!(copy.take_dirty(), [(100, PAGE + 7)]);
+        copy.take_compared(title, title + 2 * PAGE, true, true);
+        copy.take(title + 2 * PAGE, title + 3 * PAGE, false);
+        assert_eq!(super::joined(copy.take_dirty()), [(0, 3 * PAGE)]);
+        // A landing noted (it cannot be, but if it were): still marked whole.
+        copy.note_landing(0, PAGE);
+        copy.take(title, title + PAGE, true);
+        assert_eq!(copy.take_dirty(), [(0, PAGE)]);
+        // Cut to the window.
+        copy.copy(title + len - 8, title + len + PAGE);
+        assert_eq!(copy.take_dirty(), [(len - 8, len)]);
+        // What compares or merges with a CPU side does nothing.
+        let mut scratch = Vec::new();
+        let gpu = vec![9u8; 64];
+        assert_eq!(copy.card_merge(0, &gpu, &mut scratch), 0);
+        assert_eq!(copy.card_merge_relay(0, &gpu, 0, &mut scratch), 0);
+        assert!(copy.card_held(0, 64).is_empty());
+        copy.placed_copy(title, &gpu);
+        copy.writing(title, 64);
+        assert!(!copy.writes_pending(), "no range is declared");
+        // SAFETY: the piece's bytes are `gpu`'s, which stay.
+        assert_eq!(unsafe { copy.land_card(&[(0, 64, gpu.as_ptr() as usize)], 0, &mut Default::default()) }, 0);
+        assert!(copy.take_dirty().is_empty());
+        // Title memory was never written.
+        assert!(room.iter().all(|&b| b == 5));
+    }
+
+    /// Copies out of title memory cut into parts cover every byte once, in
+    /// order.
+    #[test]
+    fn title_copies_are_cut_into_parts_that_cover_them() {
+        let parts = title_parts(vec![(0x1000, 0x9000, 10), (0x2000, 0xa000, 25), (0x3000, 0xb000, 0)], 8);
+        assert_eq!(
+            parts,
+            [
+                (0x1000, 0x9000, 8),
+                (0x1008, 0x9008, 2),
+                (0x2000, 0xa000, 8),
+                (0x2008, 0xa008, 8),
+                (0x2010, 0xa010, 8),
+                (0x2018, 0xa018, 1)
+            ]
+        );
+    }
+
+    /// What goes up for a window with no CPU side is title memory's bytes,
+    /// on one thread or several; a page that is not there reads as zeros.
+    #[test]
+    fn title_bytes_are_copied_and_missing_pages_read_as_zeros() {
+        use windows_sys::Win32::System::Memory as mem;
+        for len in [3 * KERNEL_PAGE + 5, (5 << 20) + 13] {
+            let title: Vec<u8> = (0..len).map(|i| (i * 7 + i / 4096) as u8).collect();
+            let mut out = vec![0xaau8; len + 16];
+            copy_title_all(vec![(title.as_ptr() as usize, out.as_mut_ptr() as usize + 16, len)]);
+            assert!(out[..16].iter().all(|&b| b == 0xaa), "{len}: nothing before");
+            assert!(out[16..] == title[..], "{len}: the title's bytes");
+        }
+        // Reserved, not committed: zeros, and no fault.
+        // SAFETY: an allocation of our own.
+        let reserved = unsafe { mem::VirtualAlloc(std::ptr::null(), 1 << 16, mem::MEM_RESERVE, mem::PAGE_READWRITE) } as usize;
+        assert_ne!(reserved, 0);
+        let mut out = vec![0xaau8; 1 << 16];
+        copy_title_all(vec![(reserved, out.as_mut_ptr() as usize, 1 << 16)]);
+        assert!(out.iter().all(|&b| b == 0));
+        // SAFETY: ours, unused.
+        unsafe { mem::VirtualFree(reserved as *mut _, 0, mem::MEM_RELEASE) };
     }
 }
 
@@ -3521,6 +3762,25 @@ impl Shadow {
         shadow
     }
 
+    /// A window of title memory `[start, start + len)` in the card's memory
+    /// (`buffer`, at `gpu`) with no CPU side ([`window_no_cpu_side`]).
+    fn lean_window(buffer: ID3D12Resource, gpu: u64, start: u64, len: u64) -> Shadow {
+        let mut shadow = Shadow::new(buffer, std::ptr::null_mut(), gpu, start, len);
+        shadow.window = true;
+        shadow.lean = true;
+        shadow.card = Some(Card {
+            staging: None,
+            before: Mutex::default(),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            touched: Default::default(),
+            size: len,
+        });
+        WINDOW_LEAN[0].fetch_add(1, Ordering::Relaxed);
+        WINDOW_LEAN[1].fetch_add(len, Ordering::Relaxed);
+        shadow
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
@@ -3572,6 +3832,8 @@ impl Shadow {
             place: None,
             #[cfg(feature = "diagnostics")]
             moved: Default::default(),
+            lean: false,
+            spoiled: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -3600,6 +3862,27 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        if self.lean {
+            // No CPU side to bring what shaders write back by
+            // (`window_no_cpu_side`): dropped, said once, and the window
+            // gives way to one with a CPU side at the next ask.
+            WINDOW_LEAN[3].fetch_add(1, Ordering::Relaxed);
+            if !self.spoiled.swap(true, Ordering::Relaxed) {
+                static SAID: AtomicU64 = AtomicU64::new(0);
+                let said = SAID.fetch_add(1, Ordering::Relaxed);
+                if said < 16 || said.is_power_of_two() {
+                    tracing::warn!(
+                        start = format_args!("{:#x}", self.start),
+                        len = self.len,
+                        address = format_args!("{address:#x}"),
+                        write_len = len,
+                        "K6_WINDOW_NO_CPU_SIDE: shaders were declared to write a window with no CPU side; the write stays on \
+                         the card and the window is made again with a CPU side"
+                    );
+                }
+            }
+            return;
+        }
         self.written.store(true, Ordering::Relaxed);
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
@@ -3614,7 +3897,8 @@ impl Shadow {
     /// memory (fresh snapshots cost ~2.3 million page faults per world
     /// frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
-        if self.place.is_some() {
+        // (A window with no CPU side declares nothing: `gpu_writes`.)
+        if self.place.is_some() || self.lean {
             return;
         }
         // A window with no card side compares nothing from here on
@@ -4451,7 +4735,7 @@ impl Shadow {
     /// title's that arrived between the refresh and the look.
     fn refresh_check(&self, from: usize, to: usize) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1")) {
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1")) || self.lean {
             return;
         }
         const SAMPLE: usize = 256;
@@ -4688,6 +4972,10 @@ impl Shadow {
             /// A page of title memory, as read.
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
+        if self.lean {
+            // Nothing to compare with: all of it goes up, from title memory.
+            return self.copy(from, to);
+        }
         let Some(card) = self.card.as_ref().filter(|_| compare || self.changes_only.load(Ordering::Relaxed) || send_changed()) else {
             if known && self.card.is_some() && self.landing.load(Ordering::Acquire) && land_echo() && !crate::host::upcheck::on() {
                 return self.take_landed(from, to);
@@ -4735,6 +5023,13 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        if self.lean {
+            // No CPU side: it goes up from title memory (`host::send::take`).
+            if from < to {
+                self.card_changed(from - start, to - start);
+            }
+            return to.saturating_sub(from);
+        }
         let skip = self.window_skip(from, to);
         if skip == crate::windowskip::SkipSame::Skip {
             self.copy_window_skipping(from, to);
@@ -4853,6 +5148,13 @@ impl Shadow {
         self.card.is_some()
     }
 
+    /// Whether it is a window in the card's memory with no CPU side
+    /// ([`window_no_cpu_side`]): what changed goes up from title memory, and
+    /// nothing a shader writes in it can be brought back.
+    pub(crate) fn lean(&self) -> bool {
+        self.lean
+    }
+
     /// Shaders store in it what is not declared: from here on only the dwords
     /// the title changes go up ([`by_address`]).
     pub(crate) fn keep_stores(&self) {
@@ -4907,7 +5209,7 @@ impl Shadow {
     /// is declared written by it, and its sends are taken.
     pub(crate) fn placed_copy(&self, address: usize, bytes: &[u8]) {
         let (from, to) = self.inside(address, bytes.len());
-        if from >= to || self.place.is_some() {
+        if from >= to || self.place.is_some() || self.lean {
             return;
         }
         let bytes = &bytes[self.start as usize + from - address..][..to - from];
@@ -4932,7 +5234,7 @@ impl Shadow {
     /// at offsets `[at, at + len)` (cut to the copy).
     pub(crate) fn card_held(&self, at: usize, len: usize) -> Vec<u8> {
         let to = (at + len).min(self.len as usize);
-        if self.card.is_none() || at >= to {
+        if self.card.is_none() || self.lean || at >= to {
             return Vec::new();
         }
         // SAFETY: inside the mapping; the caller holds the submission lock,
@@ -4948,10 +5250,10 @@ impl Shadow {
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
     /// card side's bytes from before if made yet, and their size.
-    pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
+    pub(crate) fn card_sides(&self) -> Option<(Option<&ID3D12Resource>, Option<ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        Some((&card.staging, before, card.size))
+        Some((card.staging.as_ref(), before, card.size))
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes
@@ -5067,7 +5369,7 @@ impl Shadow {
     /// Returns the bytes written to title memory.
     pub(crate) fn card_merge(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
-        if self.card.is_none() || at + gpu.len() > self.len as usize {
+        if self.card.is_none() || self.lean || at + gpu.len() > self.len as usize {
             return 0;
         }
         // SAFETY: inside the mapping (checked above); only the submitting
@@ -5132,7 +5434,7 @@ impl Shadow {
         let Some(card) = &self.card else {
             return 0;
         };
-        if at + gpu.len() > self.len as usize {
+        if self.lean || at + gpu.len() > self.len as usize {
             return 0;
         }
         let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -5183,7 +5485,7 @@ impl Shadow {
         let mut shadow = Shadow::new(none(), data, 0, start, len);
         if card {
             shadow.card = Some(Card {
-                staging: none(),
+                staging: Some(none()),
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
@@ -5192,6 +5494,17 @@ impl Shadow {
             });
         }
         let shadow = Arc::new(shadow);
+        std::mem::forget(shadow.clone());
+        shadow
+    }
+
+    /// A window of title memory `[start, start + len)` in the card's memory
+    /// with no CPU side ([`window_no_cpu_side`]). Never let go, as
+    /// [`Shadow::unbacked`].
+    pub(crate) fn unbacked_lean(start: u64, len: u64) -> Arc<Shadow> {
+        // SAFETY: an interface pointer nothing calls.
+        let none = unsafe { std::mem::transmute::<usize, ID3D12Resource>(8) };
+        let shadow = Arc::new(Shadow::lean_window(none, 0, start, len));
         std::mem::forget(shadow.clone());
         shadow
     }
@@ -5235,7 +5548,7 @@ impl Shadow {
     /// The third of each piece is the address of its bytes, which stay as
     /// they are during the call.
     pub(crate) unsafe fn land_card(&self, pieces: &[(usize, usize, usize)], fetched_after: u64, notes: &mut crate::land::Notes) -> u64 {
-        let Some(card) = &self.card else {
+        let Some(card) = self.card.as_ref().filter(|_| !self.lean) else {
             return 0;
         };
         let waiting = std::time::Instant::now();
@@ -5341,7 +5654,7 @@ mod land_tests {
         unsafe { std::ptr::write_bytes(data, 0, len) };
         let mut shadow = Shadow::new(buffer.clone(), data, 0, title as u64, len as u64);
         shadow.card = Some(Card {
-            staging: buffer,
+            staging: Some(buffer),
             before: Mutex::default(),
             dirty: Mutex::default(),
             sent: Mutex::default(),
@@ -5762,7 +6075,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     "a buffer's host copy is in the card's memory"
                 );
                 let card = Card {
-                    staging: buffer,
+                    staging: Some(buffer),
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
@@ -5990,7 +6303,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     shadow.window = true;
     shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card {
-        staging,
+        staging: Some(staging),
         before: Mutex::default(),
         dirty: Mutex::default(),
         sent: Mutex::default(),
@@ -6140,12 +6453,30 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         } else {
             Some(named)
         };
-        if let Some(shadow) = key.and_then(|key| map.get(&key)) {
+        if let Some(shadow) = key.and_then(|key| map.get(&key))
+            && !shadow.spoiled.load(Ordering::Relaxed)
+        {
             note(shadow);
             return Some(shadow.clone());
         }
     }
     let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    // A window with no CPU side that shaders were declared to write gives way
+    // to one with a CPU side (`window_no_cpu_side`); lists that hold it keep
+    // it until they are done.
+    if window_no_cpu_side() {
+        let spoiled: Vec<(u64, u64)> = map
+            .range((cell, 0)..=(address, u64::MAX))
+            .filter(|(_, s)| s.spoiled.load(Ordering::Relaxed))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in spoiled {
+            if let Some(old) = map.remove(&key) {
+                LEAN_REFUSED.lock().unwrap_or_else(|e| e.into_inner()).insert(key.0);
+                crate::host::retire(old);
+            }
+        }
+    }
     let (start, len) = if unsized_ask && tails() {
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
         longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
@@ -6183,6 +6514,23 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
+    // In the card's memory with no CPU side (`window_no_cpu_side`): memory
+    // the write watch covers (asked now: what it finds stays noted for the
+    // first refresh, which takes every page anyway), not refused before.
+    if window_no_cpu_side()
+        && !LEAN_REFUSED.lock().unwrap_or_else(|e| e.into_inner()).contains(&start)
+        && crate::watch::writes(start as usize, (start + len) as usize, true).is_some()
+        && let Some(on_card) = window_room_for(len)
+    {
+        crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card, no CPU side"));
+        // SAFETY: a live buffer.
+        let gpu = unsafe { on_card.GetGPUVirtualAddress() };
+        let shadow = Arc::new(Shadow::lean_window(on_card, gpu, start, len));
+        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+        note(&shadow);
+        map.insert((start, len), shadow.clone());
+        return Some(shadow);
+    }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
@@ -6191,7 +6539,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         Some(on_card) => {
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {
-                staging: buffer,
+                staging: Some(buffer),
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
