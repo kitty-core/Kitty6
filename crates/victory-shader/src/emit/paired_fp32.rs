@@ -36,12 +36,29 @@ impl Lower<'_> {
         if !live().any(|(_, v)| section.shapes.get(v).is_some_and(|s| ordered_fp32(*s))) {
             return Ok(false);
         }
-        let refused = |why| unsupported(code[start].machine.offset, why);
+        // Kitty6: for a program on `DEFAULT_PAIRED` with the switch unset, a section the
+        // exact replay cannot take goes the usual paired way (the halves' host reductions
+        // joined) instead of refusing the whole paired form, whose fallbacks leave the
+        // 16x16 tiles. Replaced once Vice-Tay's fuller replay is ported.
+        let soft = std::env::var_os("VICTORY_WAVE_PAIRS_FP32").is_none_or(|m| m.is_empty())
+            && crate::emit::PAIRED_DEFAULT_HERE.get();
+        let refused = |why| -> Result<bool, Stop> {
+            if soft {
+                Ok(false)
+            } else {
+                Err(unsupported(code[start].machine.offset, why))
+            }
+        };
         // Without the guest mode confirmed (`VICTORY_WAVE_PAIRS_FP32=non-ieee-rne-ftz`), the
         // section goes the usual way: the halves' host reductions joined (`paired_shape`).
-        if !std::env::var_os("VICTORY_WAVE_PAIRS_FP32")
-            .is_some_and(|mode| mode == "non-ieee-rne-ftz")
-        {
+        // Kitty6: the programs on `DEFAULT_PAIRED` take the confirmed mode while the switch
+        // is unset (Vice-Tay #208).
+        let mode = std::env::var_os("VICTORY_WAVE_PAIRS_FP32").filter(|m| !m.is_empty());
+        let confirmed = match mode {
+            Some(m) => m == "non-ieee-rne-ftz",
+            None => crate::emit::PAIRED_DEFAULT_HERE.get(),
+        };
+        if !confirmed {
             return Ok(false);
         }
         // (this tree emits no fast-math flags: only the MODE changes are checked)
@@ -56,9 +73,7 @@ impl Lower<'_> {
                 ) && !independent_rounding_write(i)
             })
         {
-            return Err(refused(
-                "paired FP32 reduction with fast math or an unknown MODE change",
-            ));
+            return refused("paired FP32 reduction with fast math or an unknown MODE change");
         }
         let why_on = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         if let Some((_, v)) = live().find(|(_, v)| {
@@ -71,7 +86,7 @@ impl Lower<'_> {
                 eprintln!("WAVE64-FP32 section {:#x}: unsupported live-out shape {:?}",
                     code[start].machine.offset, section.shapes.get(v));
             }
-            return Err(refused("a paired FP32 section with an unsupported live-out shape"));
+            return refused("a paired FP32 section with an unsupported live-out shape");
         }
         for i in &code[start + 1..end] {
             let float_modifiers = matches!(i.name(), "v_add_f32" | "v_min_f32" | "v_max_f32")
@@ -105,7 +120,7 @@ impl Lower<'_> {
                 eprintln!("WAVE64-FP32 section {:#x}: instruction {:#x} {}: {why}",
                     code[start].machine.offset, i.machine.offset, i.name());
             }
-            return Err(refused(why));
+            return refused(why);
         }
         // Replay the guest operands in order. Lane sets alone lose intermediate rounding and NaN priority.
         self.paired_fp32 = true;
