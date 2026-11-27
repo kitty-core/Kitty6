@@ -9,6 +9,33 @@ Figures come from scripted runs on one PC (RTX 4070 12 GB, 32 GB RAM, Windows 11
 23H2, Series S profile, opening scene): each is the run's median over its last
 45 s in the world, from the run probes.
 
+## 2026-11-26 (night)
+
+**Blocky shadows and faces: fixed.** The stair-stepped sun-shadow edges, square
+cut-outs in sunlit patches and blocky tiles on faces came from the 16-bit path
+for halves (half views and integer format loads, ported earlier today). With
+both off they are gone in the game. The launcher now sets
+`VICTORY_HALF_VIEWS=0` and `K6_HALF_LOADS=0` by default; they cost some frame
+rate back, to be won again another way.
+
+- **Renderer mod:** the 10.9 ms single-group compute pass `02384a60fda6f2d0`
+  now runs every 4th frame (`mods/kitty6.k6mod`). The card's wait fell from
+  ~29 to ~11 ms a frame in the opening; the frame is now bound by the CPU
+  preparing it (~30-35 ms). No visible change in a skip-vs-run comparison.
+- **Stale textures** (after fxceless e4245f3c1b): textures under a finished
+  plain read are uploaded again, and dynamic descriptor slots go back only to
+  the heap that gave them. Textures painted through another view of their
+  pages are fingerprinted whole and kept checked (`K6_FULL_PRINT_KB`,
+  `K6_ALIASED_RECHECK_EVERY`). No measurable cost (19.4 fps).
+- **Stutters are paging, not pipelines:** in a 9-minute play run only 21
+  pipelines were made, while every 0.6-1.3 s stall lined up with tens to
+  hundreds of thousands of page faults. The process holds ~21.5 GB private
+  with ~2 GB of RAM free. Memory is the next target.
+- **Ray tracing on (`-RayTracing`)** crashed in the title after ~2 minutes and
+  costs ~40 ms of card time; the sun shining through walls (shadow rays with no
+  structures to hit) needs another way, e.g. only unpacking the shipped static
+  structures.
+
 ## 2026-11-26 (late)
 
 **The "regression" wasn't one.** The build from before today's ports, run

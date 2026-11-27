@@ -70,7 +70,7 @@ How it got here on this PC, in the order found:
 
 | | |
 |---|---|
-| <img src="docs/media/bug-blocky-tiles-on-head.jpg" width="260" alt="Blocky black squares over a character's head and back"> | **Blocky black tiles** on heads, hair and backs in some shots. |
+| <img src="docs/media/bug-blocky-tiles-on-head.jpg" width="260" alt="Blocky black squares over a character's head and back"> | **Blocky tiles** on heads, hair and backs, and stair-stepped sun shadows: **fixed** (halves by the float path, see the [dev log](docs/LOG.md)). |
 | <img src="docs/media/bug-purple-patches-grey-arms.jpg" width="260" alt="A purple patch on a wall and a grey arm"> | **Purple patches** indoors (a fix is on `dev`, not yet checked in the game) and **grey-blue arms**. |
 
 Also: four compute shaders are still refused on NVIDIA (64-lane waves). Mouths
