@@ -9,6 +9,30 @@ Figures come from scripted runs on one PC (RTX 4070 12 GB, 32 GB RAM, Windows 11
 23H2, Series S profile, opening scene): each is the run's median over its last
 45 s in the world, from the run probes.
 
+## 2026-11-27 (morning)
+
+- **Paired form for wave64 programs on NVIDIA** (`VICTORY_WAVE_PAIRED_ONLY=all`, off; not yet
+  tried in the game; `kitty6.ps1 -On PairedWave64`). One 32-lane host wave runs a whole console
+  wave: each thread carries lanes n and n + 32 and does every step for both. Two reports
+  (Yaekai/victory-scarlett-3070#2, fxceless/victory-fork#1401) say forcing every wave64 compute
+  program into this form took the dark patches off the water on NVIDIA at no fps cost. Ported
+  from fork pull requests #1397 and #1419 (ByFxbian, after PR 854 by Pilote Production and
+  darkworldhm's work); the switches follow lines9686-rgb's patch cd8fd319a. Added here: 64-bit
+  float wave sums (the five `CS_TransmissionVolumetrics*` programs need them), float sums
+  joined from the two halves where the console's order is not confirmed
+  (`VICTORY_WAVE_PAIRS_FP32=non-ieee-rne-ftz` keeps #1419's ordered sums), more shared-memory
+  atomics, and the `st64` pairs.
+  - Offline, Series S shaders: 878 of 1,151 wave64 compute programs take it. The other 273
+    keep their usual form: 150 would need a group barrier the paired form cannot place, 99
+    have groups smaller than a console wave, 18 use 16-bit or compare-swap shared memory,
+    6 other reasons. All 2,682 compute programs validate. The five
+    `CS_TransmissionVolumetrics*`, the `water_micro_geom_renderer` patch passes (all but the
+    small `CS_ClearWaterPatches`) and the `sr_tracing` water passes take it.
+  - `VICTORY_WAVE_PAIRED_ONLY=<hash>,...` for single programs,
+    `VICTORY_WAVE_PAIRED_ONLY_NOT=<hash>,...` to leave some out. Both are in the shader cache
+    key when set. With `VICTORY_WAVE_WHY=1` the log says `paired lanes, first (asked for)` for
+    each program.
+
 ## 2026-11-27 (early morning)
 
 - RAM paging is the bound: fps tracks page faults across runs (17k faults/s: 17.8 fps; 42k/s: 10 fps).

@@ -173,6 +173,18 @@ fn build() -> [u8; 32] {
             bytes.extend_from_slice(b"VICTORY_WAVE64_EMULATE=");
             bytes.extend_from_slice(value.as_encoded_bytes());
         }
+        // The paired form of wave64 programs on 32-lane hosts: tried first for the programs
+        // `VICTORY_WAVE_PAIRED_ONLY` lists (or `all`), never for those
+        // `VICTORY_WAVE_PAIRED_ONLY_NOT` lists (`victory_shader::emit::paired_choice`), also
+        // as a later form (`VICTORY_WAVE_PAIRS=1`), its float sums in the console's order
+        // (`VICTORY_WAVE_PAIRS_FP32`). Only when set, so the translations cached without them
+        // keep their key.
+        bytes.extend_from_slice(&paired_key(
+            victory_shader::emit::paired_switches()
+                .chain(["VICTORY_WAVE_PAIRS", "VICTORY_WAVE_PAIRS_FP32"].into_iter().filter_map(|name| {
+                    std::env::var_os(name).filter(|v| !v.is_empty()).map(|v| (name, v))
+                })),
+        ));
         bytes
     });
     let mut hash = blake3::Hasher::new();
@@ -181,6 +193,46 @@ fn build() -> [u8; 32] {
         hash.update(&value.to_le_bytes());
     }
     *hash.finalize().as_bytes()
+}
+
+/// The bytes the set paired-form switches add to the key ([`build`]): none when none is set.
+fn paired_key(set: impl Iterator<Item = (&'static str, std::ffi::OsString)>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for (name, value) in set {
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(b'=');
+        bytes.extend_from_slice(value.as_encoded_bytes());
+        bytes.push(0);
+    }
+    bytes
+}
+
+/// The translation of `container`, with the paired-form lists' choice for it
+/// (`victory_shader::emit::paired_choice`, by the hash a run's log names it by). Without the
+/// lists, no hash is taken.
+fn translate_with_choice(container: &[u8]) -> Result<HostShader, String> {
+    let choice = if victory_shader::emit::paired_lists_set() {
+        victory_shader::emit::paired_choice(&blake3::hash(container).to_hex()[..16])
+    } else {
+        None
+    };
+    victory_shader::emit::with_paired_choice(choice, || victory_shader::emit::translate(container))
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+#[test]
+fn the_paired_switches_change_the_key_only_when_set() {
+    assert!(paired_key(std::iter::empty()).is_empty(), "no switch: the key is as before");
+    let all = paired_key([("VICTORY_WAVE_PAIRED_ONLY", "all".into())].into_iter());
+    let one = paired_key([("VICTORY_WAVE_PAIRED_ONLY", "5dc3b25986622949".into())].into_iter());
+    let not = paired_key(
+        [("VICTORY_WAVE_PAIRED_ONLY", "all".into()), ("VICTORY_WAVE_PAIRED_ONLY_NOT", "5dc3b25986622949".into())]
+            .into_iter(),
+    );
+    assert!(!all.is_empty());
+    assert_ne!(all, one);
+    assert_ne!(all, not);
 }
 
 /// What tells one set of translations from another ([`build`]).
@@ -195,7 +247,7 @@ pub(crate) fn translation() -> [u8; 32] {
 pub fn precompile(container: &[u8]) -> Result<bool, String> {
     let _ = crate::host::host();
     let misses = MISSES.load(Ordering::Relaxed);
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = translate_with_choice;
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate, true)?,
         None => translate(container)?,
@@ -207,7 +259,7 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = translate_with_choice;
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate, refresh_in_runs()),
         None => translate(container),

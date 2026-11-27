@@ -443,6 +443,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(&loop_limit().to_le_bytes());
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
+    out.push(u8::from(wave_pairs_on()));
     out
 }
 
@@ -625,6 +626,168 @@ pub fn emit_with_retries(
     }
 }
 
+// The paired form of a console wave64 compute program on a host of 32-lane waves (NVIDIA):
+// one host wave of 32 runs the console wave, each thread carrying console lanes n and n + 32,
+// everything per lane predicated and lowered once for each of the two ([`paired`],
+// `lower::with_paired_lanes`). From fork pull requests #1397 and #1419 (ByFxbian), after
+// PR 854 (Pilote Production, 8079c9dc) and darkworldhm 840243e2; the per-program switches
+// after lines9686-rgb cd8fd319a (fxceless/victory-fork#1401, where forcing every wave64
+// compute program into this form took the dark tiles off the water on NVIDIA).
+
+thread_local! {
+    /// [`with_wave_pairs`]'s choice, for this thread's translations.
+    pub(crate) static WAVE_PAIRS_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// [`with_paired_choice`]'s choice, for this thread's translations.
+    static PAIRED_CHOICE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// What the paired form tried first made of the last program ([`take_paired_outcome`]).
+    static PAIRED_OUTCOME: std::cell::RefCell<Option<Result<(), String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` (translations) with the paired form tried first for every console wave64 compute
+/// program (`on`), as `VICTORY_WAVE_PAIRED_ONLY=all` does.
+pub fn with_wave_pairs<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WAVE_PAIRS_HERE.set(self.0);
+        }
+    }
+    let _restore = Restore(WAVE_PAIRS_HERE.replace(on));
+    f()
+}
+
+/// Runs `f` (the translation of one program) with what the paired-form lists say of it
+/// ([`paired_choice`]): `Some(true)` the paired form first, `Some(false)` never, `None` as
+/// without the lists.
+pub fn with_paired_choice<R>(choice: Option<bool>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PAIRED_CHOICE.set(self.0);
+        }
+    }
+    let _restore = Restore(PAIRED_CHOICE.replace(choice));
+    f()
+}
+
+/// What the paired form, tried first ([`with_paired_choice`]), made of the last program this
+/// thread emitted: taken, refused (why), or `None` where it was not tried. Cleared.
+pub fn take_paired_outcome() -> Option<Result<(), String>> {
+    PAIRED_OUTCOME.take()
+}
+
+/// The paired-form switches (diagnostic, off by default), by the 16-digit hashes a run's log
+/// names shaders by (`blake3` of the container), separated by commas, semicolons or white
+/// space, with or without `#`:
+/// - `VICTORY_WAVE_PAIRED_ONLY=all` or `=<hash>,...`: the paired form is tried first for every
+///   console wave64 compute program on a host of 32-lane waves, or for the listed ones; a
+///   program it does not take goes on through the other forms as before;
+/// - `VICTORY_WAVE_PAIRED_ONLY_NOT=<hash>,...`: the listed programs never take the paired
+///   form (it wins over the first list). `VICTORY_WAVE_PAIRED_NOT` (cd8fd319a's name) and
+///   `VICTORY_WAVE_PAIRS_ONLY` (#1397's list) are read too.
+///
+/// Those set are part of the shader cache key (`victory-gpu`'s `shader_cache`).
+pub fn paired_choice(hash: &str) -> Option<bool> {
+    struct Lists {
+        all: bool,
+        only: Vec<String>,
+        not: Vec<String>,
+    }
+    static LISTS: std::sync::OnceLock<Lists> = std::sync::OnceLock::new();
+    let l = LISTS.get_or_init(|| {
+        let value = |name: &str| std::env::var(name).unwrap_or_default();
+        let only = value("VICTORY_WAVE_PAIRED_ONLY");
+        let all = only.trim().eq_ignore_ascii_case("all");
+        let mut listed = if all { Vec::new() } else { hash_list(&only) };
+        listed.extend(hash_list(&value("VICTORY_WAVE_PAIRS_ONLY")));
+        let mut not = hash_list(&value("VICTORY_WAVE_PAIRED_ONLY_NOT"));
+        not.extend(hash_list(&value("VICTORY_WAVE_PAIRED_NOT")));
+        Lists { all, only: listed, not }
+    });
+    decide_paired(l.all, &l.only, &l.not, hash)
+}
+
+/// Whether any paired-form list is set ([`paired_choice`]): without one no hash need be taken.
+pub fn paired_lists_set() -> bool {
+    paired_switches().next().is_some()
+}
+
+/// The paired-form switches that are set, with their values: for the shader cache key.
+pub fn paired_switches() -> impl Iterator<Item = (&'static str, std::ffi::OsString)> {
+    [
+        "VICTORY_WAVE_PAIRED_ONLY",
+        "VICTORY_WAVE_PAIRED_ONLY_NOT",
+        "VICTORY_WAVE_PAIRED_NOT",
+        "VICTORY_WAVE_PAIRS_ONLY",
+    ]
+    .into_iter()
+    .filter_map(|name| std::env::var_os(name).filter(|v| !v.is_empty()).map(|v| (name, v)))
+}
+
+/// 16-digit hashes in `text` ([`paired_choice`]), lower case.
+fn hash_list(text: &str) -> Vec<String> {
+    text.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .map(|h| h.trim_start_matches('#').to_ascii_lowercase())
+        .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .collect()
+}
+
+/// [`paired_choice`] on the switches' values. Pure, for testing.
+fn decide_paired(all: bool, only: &[String], not: &[String], hash: &str) -> Option<bool> {
+    let hash = hash.trim_start_matches('#').to_ascii_lowercase();
+    let listed = |list: &[String]| hash.len() >= 16 && list.iter().any(|h| hash.starts_with(h.as_str()));
+    if listed(not) {
+        Some(false)
+    } else if all || listed(only) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn the_paired_lists_choose_per_program() {
+    const A: &str = "5dc3b25986622949";
+    const B: &str = "6f225b641c5b0708";
+    let (only, not) = (hash_list("#5DC3B25986622949, junk 5dc3"), hash_list(B));
+    assert_eq!(only, vec![A.to_owned()], "16-digit hashes only, any case, with or without #");
+    assert_eq!(decide_paired(false, &[], &[], A), None, "as before without lists");
+    assert_eq!(decide_paired(false, &only, &[], A), Some(true));
+    assert_eq!(decide_paired(false, &only, &[], &format!("#{A}")), Some(true));
+    assert_eq!(decide_paired(false, &only, &[], B), None);
+    assert_eq!(decide_paired(false, &only, &[], "5dc3"), None, "a short hash is not listed");
+    assert_eq!(decide_paired(true, &[], &[], B), Some(true), "all");
+    assert_eq!(decide_paired(true, &[], &not, B), Some(false), "NOT wins over all");
+    assert_eq!(decide_paired(false, &not, &not, B), Some(false), "NOT wins over a list");
+    assert_eq!(decide_paired(false, &[], &not, A), None);
+}
+
+#[cfg(test)]
+#[test]
+fn the_paired_choice_scope_is_restored() {
+    assert_eq!(PAIRED_CHOICE.get(), None);
+    with_paired_choice(Some(true), || {
+        assert_eq!(PAIRED_CHOICE.get(), Some(true));
+        let r = std::panic::catch_unwind(|| with_paired_choice(Some(false), || panic!("translation panic")));
+        assert!(r.is_err());
+        assert_eq!(PAIRED_CHOICE.get(), Some(true));
+    });
+    assert_eq!(PAIRED_CHOICE.get(), None);
+}
+
+#[cfg(test)]
+#[test]
+fn listed_wave_pairs_scope_is_restored() {
+    assert!(!WAVE_PAIRS_HERE.get());
+    with_wave_pairs(true, || {
+        assert!(WAVE_PAIRS_HERE.get());
+        with_wave_pairs(false, || assert!(!WAVE_PAIRS_HERE.get()));
+        assert!(WAVE_PAIRS_HERE.get());
+    });
+    assert!(!WAVE_PAIRS_HERE.get());
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -636,6 +799,32 @@ pub fn emit(
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
+    let wave32_compute =
+        native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32;
+    let choice = PAIRED_CHOICE.get();
+    let listed = (WAVE_PAIRS_HERE.get() || choice == Some(true)) && choice != Some(false);
+    PAIRED_OUTCOME.set(None);
+    if listed && wave32_compute {
+        // (`VICTORY_WAVE_PAIRED_ONLY`: the paired form before every other form)
+        let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+        let outcome = match paired(c, native, p) {
+            Ok((shader, Some(32))) => {
+                if why {
+                    eprintln!("WAVE64-RETRY paired lanes, first (asked for): wave Some(32){}", why_tag());
+                }
+                PAIRED_OUTCOME.set(Some(Ok(())));
+                lower::take_needs();
+                return Ok(shader);
+            }
+            Ok((_, wave)) => format!("asks for wave {wave:?}"),
+            Err(e) => e.to_string(),
+        };
+        if why {
+            eprintln!("WAVE64-RETRY paired lanes, first (asked for): {outcome}{}", why_tag());
+        }
+        PAIRED_OUTCOME.set(Some(Err(outcome)));
+        lower::take_needs();
+    }
     let original = emit_program(c, native, p, st, io, res);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
@@ -647,10 +836,29 @@ pub fn emit(
         Err(ShaderError::Unsupported { what, .. }) => lower::needs_every_lane(what),
         Err(_) => false,
     };
+    let pairs_on = wave_pairs_on() && !listed && choice != Some(false);
+    if wave32_compute
+        && pairs_on
+        && !stuck
+        && (matches!(native.io, crate::native::StageIo::Cs(cs) if cs.lds_bytes() > 0)
+            || lower::crosses_halves(p, st)
+                && (original.is_err() || lower::wave_local(p, st).is_err()))
+    {
+        let again = paired(c, native, p);
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            match &again {
+                Ok((_, wave)) => eprintln!("WAVE64-RETRY paired Wave64: wave {wave:?}{}", why_tag()),
+                Err(e) => eprintln!("WAVE64-RETRY paired Wave64: {e}{}", why_tag()),
+            }
+        }
+        if let Ok((shader, Some(32))) = again {
+            return Ok(shader);
+        }
+    }
     // (a mask with lanes elsewhere is only helped by the exact forms: not by each half-wave
     // on its own)
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
-    if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
+    if stuck && wave32_compute {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
@@ -745,6 +953,13 @@ pub fn emit(
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
             if !exact {
+                if pairs_on {
+                    let again = paired(c, native, p);
+                    report("paired Wave64", &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
                 // Before anything approximate, the exact forms that cost group barriers.
                 // Every skip left out that the code after it cannot see
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
@@ -941,7 +1156,7 @@ fn widen(
             }
             return r;
         }
-        let more: Vec<usize> = lower::branches_around(&st, &needs)
+        let more: Vec<usize> = lower::branches_around_with_loop_exits(&st, &needs, native.wave64 && lower::host_max_wave() == 32 && lower::loop_exits_on())
             .unwrap_or_default()
             .into_iter()
             .filter(|b| !wide.contains(b))
@@ -954,6 +1169,102 @@ fn widen(
         }
         wide.extend(more);
     }
+}
+
+/// `VICTORY_WAVE_PAIRS=1` (#1397, off by default): the paired form also as one of the later
+/// forms, for programs the exact forms leave stuck.
+fn wave_pairs_on() -> bool {
+    std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "1")
+}
+
+// Paired lanes from PR #854 (PiloteCode), including the per-wave CFG used by 840243e2.
+fn paired(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let crate::native::StageIo::Cs(cs) = native.io else {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired lanes outside compute",
+        });
+    };
+    if crate::spill::is_spilled(native) {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired Wave64 for spilled DispatchX programs is not validated",
+        });
+    }
+    let threads = cs.threads.iter().product::<u32>();
+    if threads == 0 || threads > 1024 || threads % 64 != 0 {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired lanes in a thread group that does not fill its console waves",
+        });
+    }
+    if p.blocks.first().is_some_and(|b| !b.preds.is_empty()) {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired Wave64 requires a single-entry wave prologue",
+        });
+    }
+    let lds = cs.lds_bytes();
+    if lds + 4 * u32::from(threads > 64) > 32 * 1024 {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired Wave64 exceeds the compute group shared-memory limit",
+        });
+    }
+    let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+    let accesses_lds = insts().any(lower::accesses_lds);
+    if accesses_lds
+        && (lds == 0 || insts().filter(|i| lower::accesses_lds(i)).any(|i| {
+            !lower::supports_paired_lds(i.name())
+        }))
+    {
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            let mut names: Vec<&str> = insts()
+                .filter(|i| lower::accesses_lds(i) && !lower::supports_paired_lds(i.name()))
+                .map(|i| i.name())
+                .collect();
+            names.sort_unstable();
+            names.dedup();
+            eprintln!("WAVE64-PAIRED LDS operations it does not take: {names:?}{}", why_tag());
+        }
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "an LDS operation not supported by paired Wave64",
+        });
+    }
+    let waits = accesses_lds || insts().any(|i| i.name() == "s_barrier");
+    // Independently progressing waves cannot rendezvous after a divergent exit.
+    if (threads > 64 && p.blocks.len() > 1 && waits)
+        || (group_sync() == 0 && (threads > 64 || waits))
+    {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired Wave64 would require an unavailable group rendezvous",
+        });
+    }
+    // every per-lane branch the wave's; again while that leaves another branch per lane
+    let mut wide = std::collections::HashSet::new();
+    let st = loop {
+        let st = structure::structure_wide(p, &wide)?;
+        let lanes: Vec<usize> = (0..st.exits.len())
+            .filter(|b| !wide.contains(b))
+            .filter(|&b| {
+                matches!(st.exits[b], structure::LaneExit::Branch { when, .. }
+                    if !st.bools.support(when).iter().all(|a| matches!(a, structure::Atom::Uniform(_))))
+            })
+            .collect();
+        if lanes.is_empty() {
+            break st;
+        }
+        wide.extend(lanes);
+    };
+    let io = io::raise(p, native)?;
+    let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+    lower::with_paired_lanes(|| emit_program(c, native, p, &st, &io, &res))
 }
 
 /// The translated program, and the wave size it requires of the host.
