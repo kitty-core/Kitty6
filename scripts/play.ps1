@@ -61,6 +61,10 @@ $settings = @{
     # Streamed voices (dialogue) go on when the title refills them, as codec-d/cool_fox
     # always does: without it speech stalls, and lip sync with it.
     VICTORY_XMA_REFILL = '1'
+    # Halves (16-bit values) go by the float path: the 16-bit views and loads made sun
+    # shadows and faces blocky on NVIDIA (stair-stepped shadow edges, square cut-outs;
+    # gone with both off, 2026-11-26). -More @{VICTORY_HALF_VIEWS='1'; K6_HALF_LOADS='1'} to try them.
+    VICTORY_HALF_VIEWS = '0'; K6_HALF_LOADS = '0'
 }
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
