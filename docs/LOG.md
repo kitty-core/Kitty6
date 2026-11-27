@@ -9,6 +9,25 @@ Figures come from scripted runs on one PC (RTX 4070 12 GB, 32 GB RAM, Windows 11
 23H2, Series S profile, opening scene): each is the run's median over its last
 45 s in the world, from the run probes.
 
+## 2026-11-27 (early morning)
+
+- RAM paging is the bound: fps tracks page faults across runs (17k faults/s: 17.8 fps; 42k/s: 10 fps).
+  A kernel page-fault trace (xperf, 12 s) found 408,000 faults in the process: 265,000 transition
+  (190,000 in `victory_safe_copy_at` reading title memory Windows had trimmed), 139,000 demand-zero
+  (mimalloc purging, the probe's thread snapshot). Fixes (untested in game yet): a hard minimum working
+  set (`K6_HARD_WORKING_SET`, on), `MIMALLOC_PURGE_DELAY=1000` in `-Lean`, probe thread snapshots every 30 s.
+- RAM copies dropped (untested in game): `K6_WINDOW_NO_CPU_SIDE` (windows on the card without a CPU side,
+  `-Lean` with 2048 MB), `K6_BUFFER_NO_CPU_SIDE` (card buffer copies filled once, after 30 s),
+  `K6_SEND_SPARE_S` (idle spare send memory let go). GPU upload heaps are unsupported here (Windows 23H2).
+- Ported from Peppacodes/playablegames-peppa: `VICTORY_BURY_ASIDE`, `VICTORY_LAND_ASIDE` (on in `-Lean`),
+  `VICTORY_SKIP_WC_BACK`/`_KEEP`, `VICTORY_MERGE_SUBMISSIONS` (off), the placement census,
+  `VICTORY_STAGING_SETTLE_S`, `VICTORY_LIST_POOL_IDLE_S` (off).
+- 2/3 render scale on the Series X profile: 5.5 fps, 23,800 pages in/s. Ruled out.
+- Water glitches and the prison-scene gradient: suspects are the five CS_TransmissionVolumetrics programs
+  translated with APPROXIMATE wave64 emulation, and the water reflection passes. An exact translation is in
+  progress. Skipping them by mod rule cleaned the water in shots.
+- Live numbers: https://kitty-core.github.io
+
 ## 2026-11-26 (later that night)
 
 - **PC controls** (on `dev`, not yet tried in the game): mouse camera,
