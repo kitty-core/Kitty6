@@ -269,6 +269,55 @@ pub fn use_console_timers() {
         timeBeginPeriod(1);
     }
     ahead_of_other_programs();
+    keep_resident();
+}
+
+/// Asks Windows to keep at least half of the PC's RAM of this process in
+/// memory (a soft minimum working set, `K6_MIN_WORKING_SET_MB=<MB>`; `0`:
+/// not asked). With RAM short (22 GB private on a 32 GB PC) the system took
+/// pages from the game as readily as from idle programs, more so while its
+/// window was not in front, and each stall of 0.6-1.3 s lined up with tens
+/// to hundreds of thousands of faults. A soft minimum makes the trimmer go to
+/// processes above their minimum first; it is never a hard lock, and the
+/// right to raise it is every user's (SeIncreaseWorkingSetPrivilege). If the
+/// system refuses the size, it is halved until it takes one or gives up.
+#[cfg(windows)]
+fn keep_resident() {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use windows_sys::Win32::System::Memory::{
+        QUOTA_LIMITS_HARDWS_MAX_DISABLE, QUOTA_LIMITS_HARDWS_MIN_DISABLE, SetProcessWorkingSetSizeEx,
+    };
+    // SAFETY: plain data the call fills in.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a sized structure.
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return;
+    }
+    let mut want = match std::env::var("K6_MIN_WORKING_SET_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(0) => return,
+        Some(mb) => mb << 20,
+        None => m.ullTotalPhys / 2,
+    };
+    let max = m.ullTotalPhys;
+    while want >= 1 << 30 {
+        // SAFETY: a plain process setting.
+        let ok = unsafe {
+            SetProcessWorkingSetSizeEx(
+                GetCurrentProcess(),
+                want as usize,
+                max as usize,
+                QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE,
+            )
+        } != 0;
+        if ok {
+            tracing::info!(min_mb = want >> 20, "a soft minimum working set (K6_MIN_WORKING_SET_MB=0: none)");
+            return;
+        }
+        want /= 2;
+    }
+    tracing::warn!("the system refused a minimum working set of 1 GB or more");
 }
 
 /// The title's streaming thread runs below normal priority (on the console

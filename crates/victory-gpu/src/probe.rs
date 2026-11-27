@@ -93,7 +93,23 @@ pub const COLUMNS: &[&str] = &[
     "cpu_cores",
     "busiest_thread",
     "busiest_thread_cores",
+    "focused",
 ];
+
+/// Whether the window in front is one of this process's: Windows gives the
+/// window in front longer time slices, the GPU scheduler's favour and the
+/// last say on memory, and runs differ by several frames a second with it.
+#[cfg(windows)]
+fn focused() -> bool {
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    // SAFETY: plain queries; a null window gives process 0.
+    unsafe {
+        let window = GetForegroundWindow();
+        let mut pid = 0u32;
+        !window.is_null() && GetWindowThreadProcessId(window, &mut pid) != 0 && pid == GetCurrentProcessId()
+    }
+}
 
 /// The folder asked for, made and allowed; `None`: the probes are off.
 fn folder() -> Option<&'static PathBuf> {
@@ -616,7 +632,7 @@ pub(crate) fn second(line: Line) {
     let pipeline_ms_mean = if made > 0 { making_us as f64 / made as f64 / 1e3 } else { 0.0 };
     if let Some(writer) = out.file.as_mut() {
         let row = format!(
-            "{:.1},{:.0},{:.2},{:.1},{:.1},{:.1},{:.1},{},{},{},{:.1},{},{},{:.1},{:.1},{:.0},{:.0},{},{},{:.1},{:.1},{:.1},{},{},{:.0},{:.1},{:.0},{},{},{},{},{},{},{:.2},{},{:.2}",
+            "{:.1},{:.0},{:.2},{:.1},{:.1},{:.1},{:.1},{},{},{},{:.1},{},{},{:.1},{:.1},{:.0},{:.0},{},{},{:.1},{:.1},{:.1},{},{},{:.0},{:.1},{:.0},{},{},{},{},{},{},{:.2},{},{:.2},{}",
             t_s,
             line.frames,
             line.fps,
@@ -653,6 +669,7 @@ pub(crate) fn second(line: Line) {
             cores,
             out.busiest.0.replace(',', ";"),
             out.busiest.1,
+            u8::from(focused()),
         );
         debug_assert_eq!(row.split(',').count(), COLUMNS.len(), "a probe row and its columns differ");
         if writeln!(writer, "{row}").and_then(|()| writer.flush()).is_err() {
