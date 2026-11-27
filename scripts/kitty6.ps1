@@ -6,7 +6,7 @@
 #   scripts\kitty6.ps1 -Exe <exe> -Off HardWorkingSet,LeanBuffers    # Current minus some changes
 #   scripts\kitty6.ps1 -List                                         # the switches by name
 #
-# The log goes to %LOCALAPPDATA%ictoryogskitty6-<time>.log; -Console prints it instead.
+# The log goes to %LOCALAPPDATA%\victory\logs\kitty6-<time>.log; -Console prints it instead.
 # -Exe can be left out once K6_EXE is set to the executable's path. -Probe and
 # -Panel are passed through; anything else goes in -More @{NAME='value'}.
 param(
