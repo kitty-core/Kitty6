@@ -686,6 +686,13 @@ pub fn with_paired_default<R>(default: bool, f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Whether the program being translated is on [`DEFAULT_PAIRED`] ([`with_paired_default`]):
+/// its FP32 reductions replay with the confirmed guest mode unless `VICTORY_WAVE_PAIRS_FP32`
+/// says otherwise (`paired_fp32`; Vice-Tay's name for [`PAIRED_DEFAULT_HERE`]).
+pub(crate) fn paired_by_default_here() -> bool {
+    PAIRED_DEFAULT_HERE.get()
+}
+
 /// What the paired form, tried first ([`with_paired_choice`]), made of the last program this
 /// thread emitted: taken, refused (why), or `None` where it was not tried. Cleared.
 pub fn take_paired_outcome() -> Option<Result<(), String>> {
