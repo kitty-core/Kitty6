@@ -1,0 +1,18 @@
+# Kitty6 renderer mods: rules of our own, read by crates/victory-gpu/src/kitty6.rs.
+# A rule names a translated shader by its runtime hash (as the log and
+# `victory replay --timing detailed` print it) and says what to do with the
+# draws and dispatches that use it. Nothing of the title is in this file.
+#
+#   <16 hex digits> skip              never run (joins foxhound's VICTORY_LEAVE_OUT)
+#   <16 hex digits> every <n>         run in one frame of n (results stay in place between)
+#   <16 hex digits> every <n> at <k>  ... in frames whose number % n == k
+#
+# scripts\kitty6.ps1 passes every mods\*.k6mod unless -NoMods.
+
+# 02384a60fda6f2d0: the decal heap's defragmentation, one 1x1x1 compute
+# dispatch of ~11 ms a frame on NVIDIA. Foxhound leaves it out by default
+# (VICTORY_LEAVE_OUT in scripts\play-foxhound.ps1), which wins over any rule
+# here. On the old base we ran it every 4th frame instead; to try that here,
+# take it out of VICTORY_LEAVE_OUT (kitty6.ps1 -More @{VICTORY_LEAVE_OUT='731a39171b568298'})
+# and uncomment:
+# 02384a60fda6f2d0 every 4

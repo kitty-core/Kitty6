@@ -62,15 +62,22 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
 /// `CS_DefragHeap_ComputeRelocations` (02384a60fda6f2d0), translatable for
 /// 32-lane hosts through host waves that meet by spinning, took 11.85 ms of
 /// the card a frame in the first gameplay area (timing run, 2026-11-26).
+/// Kitty6 mods' `skip` rules (`VICTORY_MODS`, `crate::kitty6`) join the list.
 fn leave_out() -> &'static [String] {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     HASHES.get_or_init(|| {
-        std::env::var("VICTORY_LEAVE_OUT")
+        let mut hashes: Vec<String> = std::env::var("VICTORY_LEAVE_OUT")
             .unwrap_or_default()
             .split(',')
             .map(|h| h.trim().to_ascii_lowercase())
             .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
-            .collect()
+            .collect();
+        for hash in crate::kitty6::skipped() {
+            if !hashes.iter().any(|h| h == hash) {
+                hashes.push(hash.to_owned());
+            }
+        }
+        hashes
     })
 }
 

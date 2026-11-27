@@ -421,6 +421,9 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// The Kitty6 mod `every` rule that applies to it ([`crate::kitty6`]).
+    #[cfg(windows)]
+    kitty6: Option<u16>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -514,6 +517,13 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         .map(|shader| shader.hash.as_str())
 }
 
+/// Whether a Kitty6 mod's `every` rule holds this pipeline's draw or
+/// dispatch back now (`crate::kitty6`).
+#[cfg(windows)]
+pub(crate) fn kitty6_holds(this: This) -> bool {
+    !this.is_null() && pipeline(this).kitty6.is_some_and(crate::kitty6::holds)
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
@@ -595,6 +605,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        kitty6: crate::kitty6::rule_for(shaders.iter().map(|s| s.hash.as_str())),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });

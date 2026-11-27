@@ -17,6 +17,8 @@
 
 #[cfg(windows)]
 mod ahead;
+#[cfg(windows)]
+pub mod kitty6;
 mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
