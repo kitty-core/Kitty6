@@ -679,11 +679,22 @@ fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_
     // SAFETY: a block in flight is valid.
     let (handle, routine) = unsafe { ((*block).queue, (*block).callback) };
     let (status, size) = words(block);
-    if result < 0 || required_size == 0 {
-        release(block);
+    // A call that ends here stays findable while its cleanup runs, and leaves
+    // the table under its lock as its status is published: a status query
+    // waiting at the same time must not miss the call and read E_PENDING
+    // before the result is there (after spk-c 06224d484). No provider runs
+    // under `CALLS`.
+    let retire = result < 0 || required_size == 0;
+    if retire {
+        call.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
+    }
+    let mut calls = retire.then(|| lock(&CALLS));
+    if let Some(calls) = calls.as_mut() {
+        calls.remove(&(block as usize));
     }
     size.store(required_size, Ordering::Release);
     status.store(result as u32 as usize, Ordering::Release);
+    drop(calls);
     *done = true;
     call.finished.notify_all();
     drop(done);
