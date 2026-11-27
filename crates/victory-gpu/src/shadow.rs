@@ -35,7 +35,10 @@ pub(crate) struct Shadow {
     /// The bytes of `buffer`, once asked.
     width: std::sync::OnceLock<u64>,
     pub(crate) buffer: ID3D12Resource,
-    data: *mut u8,
+    /// What the CPU side maps (null for a copy with no CPU side). Changes
+    /// only at the sweep, when a buffer's copy lets its CPU side go or gets
+    /// one back ([`settle_lean_buffers`]); read through [`Shadow::data`].
+    data_ptr: std::sync::atomic::AtomicPtr<u8>,
     gpu: u64,
     /// Where the title buffer starts and how long it is.
     start: u64,
@@ -120,11 +123,17 @@ pub(crate) struct Shadow {
     /// A window in the card's memory with no CPU side
     /// ([`window_no_cpu_side`]): `data` is null, `Card::staging` is `None`,
     /// and what changed goes up straight from title memory.
-    lean: bool,
+    lean: std::sync::atomic::AtomicBool,
     /// Of a `lean` window: shaders were declared to write it, which it cannot
     /// bring back. The next ask for its memory makes a window with a CPU side
     /// in its place ([`loose`]).
     spoiled: std::sync::atomic::AtomicBool,
+    /// When it was made ([`crate::host::now_ms`]).
+    made: u64,
+    /// Refreshes that copied title bytes in (the census's fills, in every
+    /// build): a buffer's copy filled once may go without a CPU side
+    /// ([`buffer_no_cpu_side`]).
+    fills: AtomicU64,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -134,7 +143,7 @@ struct Card {
     /// is copied into it as into any copy, and what changed in it goes to
     /// the card's side before the next submission. `None` for a window with
     /// no CPU side ([`window_no_cpu_side`]).
-    staging: Option<ID3D12Resource>,
+    staging: Mutex<Option<ID3D12Resource>>,
     /// The card side's bytes as they were when the submission's shaders
     /// started, in the card's memory too: made when shader writes are
     /// first declared for the copy, and compared with the card's side, on
@@ -736,13 +745,20 @@ pub(crate) fn window_sides() -> [u64; 6] {
         let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         let mut seen = std::collections::HashSet::new();
         for s in loose.values().filter(|s| seen.insert(Arc::as_ptr(s) as usize)) {
-            if s.card.is_some() && !s.lean {
+            if s.card.is_some() && !s.lean() {
                 sided += 1;
                 sided_bytes += s.len;
             }
         }
     }
     [lean[0], lean[1], sided, sided_bytes, WINDOW_LEAN[2].load(Ordering::Relaxed), WINDOW_LEAN[3].load(Ordering::Relaxed)]
+}
+
+/// Bytes sent up straight from title memory (`host::send::take`) to windows
+/// and to buffers' copies with no CPU side.
+pub(crate) fn note_title_sends(windows: u64, buffers: u64) {
+    WINDOW_LEAN[2].fetch_add(windows, Ordering::Relaxed);
+    BUFFER_LEAN[5].fetch_add(buffers, Ordering::Relaxed);
 }
 
 /// Copies of title memory into memory of ours (from, to, bytes), each read
@@ -755,7 +771,6 @@ pub(crate) fn copy_title_all(copies: Vec<(usize, usize, usize)>) {
     if bytes == 0 {
         return;
     }
-    WINDOW_LEAN[2].fetch_add(bytes as u64, Ordering::Relaxed);
     if bytes <= 1 << 20 {
         for (src, dst, len) in copies {
             crate::host::copy_mapped(dst as *mut u8, src as *const u8, len, false);
@@ -781,6 +796,268 @@ fn title_parts(copies: Vec<(usize, usize, usize)>, part: usize) -> Vec<(usize, u
         }
     }
     parts
+}
+
+/// How far title buffers' copies in the card's memory go without a CPU side
+/// (`K6_BUFFER_NO_CPU_SIDE`; off by default): `1` those the title filled
+/// once, `2` also those it keeps writing; never one that shaders write.
+///
+/// A buffer's copy on the card ([`cards`]) has a CPU side of its full size
+/// in the PC's memory (`Card::staging`, private memory of the process) that
+/// title memory is copied into and the changed ranges go up from, and that a
+/// shader write is merged against. The placement census found 1.2 GB of such
+/// sides of buffers filled once that only the card reads, and more of buffers
+/// the title keeps writing that no shader writes. For those the side only
+/// repeats title memory, which is in the PC's memory anyway, and a window
+/// with no CPU side (`K6_WINDOW_NO_CPU_SIDE`) shows what stands in for it:
+/// the sends of each submission are taken into upload memory of its own
+/// straight from title memory (`host::send::take`), and the write watch says
+/// which pages changed.
+///
+/// What it takes, and when:
+///
+/// - Not when the copy is made, since nothing yet says whether shaders write
+///   it: at the sweep (once a second, nothing in the air,
+///   [`settle_lean_buffers`]) a copy goes without its CPU side once it is
+///   `K6_BUFFER_NO_CPU_SIDE_S` seconds old (30 by default, 5 at least), no
+///   shader was ever declared to write it, nothing stores in it by address
+///   (`Shadow::keep_stores`), its memory is watched (the kernel or the
+///   guards), and, with `1`, it was filled once. The census classifies by the
+///   same marks. The card side stays the same buffer, so every view and
+///   descriptor of it stays right; the CPU side is kept until the next sweep
+///   (a list being prepared may still copy from it) and then let go.
+/// - Should shaders be declared to write such a copy later, the write is
+///   said in the log and its copy-back dropped (what they wrote stays on
+///   the card), and at the next sweep the copy gets a CPU side again,
+///   filled from title memory, and never goes without one again. Bytes the
+///   shaders wrote that the title did not get differ from that side: a later
+///   declared write over them brings them back as its own.
+/// - The same switches as for windows ([`lean_possible`]): not without
+///   `VICTORY_SEND_OWN`, nor with `VICTORY_SEND_CHANGED` or
+///   `VICTORY_UPCOPY_CHECK`.
+///
+/// The card's budget is not touched: the card side was counted in
+/// `CARD_BYTES` when made, and stays so. The memory line says how many
+/// copies went without a CPU side and what they hold ("title buffers' copies
+/// in the card's memory with no CPU side").
+fn buffer_no_cpu_side() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let asked = buffer_lean_mode(std::env::var("K6_BUFFER_NO_CPU_SIDE").ok().as_deref());
+        let possible = lean_possible(cards(), crate::host::sends_ready(), send_changed(), crate::host::upcheck::on());
+        let mode = if possible { asked } else { 0 };
+        if asked != 0 {
+            tracing::info!(
+                asked,
+                mode,
+                settle_s = buffer_lean_settle_ms() / 1000,
+                "K6_BUFFER_NO_CPU_SIDE: title buffers' copies in the card's memory let their CPU side go"
+            );
+        }
+        mode
+    })
+}
+
+/// The mode a value of `K6_BUFFER_NO_CPU_SIDE` asks for. Pure.
+fn buffer_lean_mode(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    }
+}
+
+/// How old a copy is before it may let its CPU side go
+/// (`K6_BUFFER_NO_CPU_SIDE_S`, seconds: 30 by default, 5 at least).
+fn buffer_lean_settle_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        let s = std::env::var("K6_BUFFER_NO_CPU_SIDE_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(30);
+        s.max(5) * 1000
+    })
+}
+
+/// What decides whether a buffer's copy lets its CPU side go now
+/// ([`buffer_no_cpu_side`]).
+#[derive(Clone, Copy, Debug)]
+struct LeanAsk {
+    mode: u8,
+    age_ms: u64,
+    settle_ms: u64,
+    fills: u64,
+    /// Shaders were ever declared to write it, or said to.
+    written: bool,
+    /// Shaders store in it by address.
+    stores: bool,
+    /// The write watch state (`Shadow::watched`).
+    watched: u8,
+    /// Ranges are pending, or a twin of the card side's bytes was made.
+    busy: bool,
+    /// It had a CPU side back once.
+    refused: bool,
+}
+
+/// Whether a buffer's copy in the card's memory lets its CPU side go. Pure.
+fn may_go_lean(a: LeanAsk) -> bool {
+    a.mode != 0
+        && a.age_ms >= a.settle_ms
+        && (a.mode >= 2 || a.fills <= 1)
+        && !a.written
+        && !a.stores
+        && matches!(a.watched, 1 | GUARDED)
+        && !a.busy
+        && !a.refused
+}
+
+/// Buffers' copies with no CPU side alive and their bytes; since the start
+/// those that let it go and their bytes, declared writes dropped, bytes sent
+/// to them straight from title memory, and those that got a CPU side back.
+static BUFFER_LEAN: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// Starts of title buffers whose copies got a CPU side back: they keep it.
+static BUFFER_LEAN_REFUSED: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// CPU sides let go at the last sweep, with their copies: dropped at the
+/// next one, when what was being prepared then has run.
+static PARKED: Mutex<Vec<(std::sync::Weak<Shadow>, ID3D12Resource)>> = Mutex::new(Vec::new());
+
+/// For the memory line: buffers' copies with no CPU side (count, bytes);
+/// since the start those that let it go (count, bytes), declared writes
+/// dropped, bytes sent to them from title memory, copies given a CPU side
+/// back.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn buffer_sides() -> [u64; 7] {
+    [0, 1, 2, 3, 4, 5, 6].map(|i| BUFFER_LEAN[i].load(Ordering::Relaxed))
+}
+
+/// At the sweep (nothing in the air, nothing being prepared; called by the
+/// thread that submits): CPU sides let go at the last sweep are dropped,
+/// copies that shaders were declared to write get a CPU side back, and
+/// copies that may go without one let it go ([`buffer_no_cpu_side`]).
+pub(crate) fn settle_lean_buffers() {
+    let parked = std::mem::take(&mut *PARKED.lock().unwrap_or_else(|e| e.into_inner()));
+    for (copy, side) in parked {
+        // Nothing reads the side's mapping any more (every reader looks at
+        // `lean` first): null, so that one that did would fault at once.
+        if let Some(copy) = copy.upgrade()
+            && copy.lean()
+        {
+            copy.data_ptr.store(std::ptr::null_mut(), Ordering::Release);
+        }
+        crate::host::retire_resource(side);
+    }
+    let mode = buffer_no_cpu_side();
+    if mode == 0 {
+        return;
+    }
+    let now = crate::host::now_ms();
+    let settle_ms = buffer_lean_settle_ms();
+    // Under the map's read lock, holding no copy (the last hold of one let
+    // go here would free it on this thread).
+    let map = buffers_read();
+    let refused = BUFFER_LEAN_REFUSED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut given_back = 0;
+    for copy in map.values().filter_map(|e| e.shadow.as_ref()) {
+        let Some(card) = copy.card.as_ref().filter(|_| !copy.window && copy.place.is_none() && !copy.mapped) else {
+            continue;
+        };
+        if copy.lean() {
+            // At most a few a sweep: each is a buffer and a copy of all of it.
+            if copy.spoiled.load(Ordering::Relaxed) && given_back < 4 && copy.side_back(card) {
+                given_back += 1;
+            }
+            continue;
+        }
+        let ask = LeanAsk {
+            mode,
+            age_ms: now.saturating_sub(copy.made),
+            settle_ms,
+            fills: copy.fills.load(Ordering::Relaxed),
+            written: copy.written.load(Ordering::SeqCst) || copy.written_said.load(Ordering::Relaxed),
+            stores: copy.changes_only.load(Ordering::SeqCst),
+            watched: copy.watched.load(Ordering::Relaxed),
+            busy: !copy.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+                || card.before.lock().unwrap_or_else(|e| e.into_inner()).is_some(),
+            refused: refused.contains(&copy.start),
+        };
+        if may_go_lean(ask) {
+            copy.side_go(card);
+        }
+    }
+}
+
+impl Shadow {
+    /// Lets the CPU side of a buffer's copy in the card's memory go
+    /// ([`settle_lean_buffers`]); kept to the next sweep ([`PARKED`]).
+    fn side_go(self: &Arc<Shadow>, card: &Card) {
+        let Some(side) = self.side_off(card) else {
+            return;
+        };
+        // (What changed and has not gone up yet goes from title memory now.)
+        PARKED.lock().unwrap_or_else(|e| e.into_inner()).push((Arc::downgrade(self), side));
+        BUFFER_LEAN[0].fetch_add(1, Ordering::Relaxed);
+        BUFFER_LEAN[1].fetch_add(self.len, Ordering::Relaxed);
+        let n = BUFFER_LEAN[2].fetch_add(1, Ordering::Relaxed) + 1;
+        let bytes = BUFFER_LEAN[3].fetch_add(self.len, Ordering::Relaxed) + self.len;
+        if n <= 8 || n.is_power_of_two() {
+            tracing::info!(
+                start = format_args!("{:#x}", self.start),
+                len = self.len,
+                fills = self.fills.load(Ordering::Relaxed),
+                "K6_BUFFER_NO_CPU_SIDE: a title buffer's copy in the card's memory lets its CPU side go ({n} so far, {} MB)",
+                bytes >> 20
+            );
+        }
+    }
+
+    /// [`Shadow::side_go`] without the keeping and the counting: the copy is
+    /// `lean` from here on and its CPU side is given, unless a write was
+    /// declared meanwhile.
+    fn side_off(&self, card: &Card) -> Option<ID3D12Resource> {
+        self.lean.store(true, Ordering::SeqCst);
+        // A write declared meanwhile (`gpu_writes` stores `written` before
+        // it looks at `lean`): the side stays.
+        if self.written.load(Ordering::SeqCst) || self.changes_only.load(Ordering::SeqCst) {
+            self.lean.store(false, Ordering::SeqCst);
+            return None;
+        }
+        let side = card.staging.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if side.is_none() {
+            self.lean.store(false, Ordering::SeqCst);
+        }
+        side
+    }
+
+    /// Gives a buffer's copy with no CPU side that shaders were declared to
+    /// write a CPU side again, filled from title memory
+    /// ([`settle_lean_buffers`]). Whether it has one now.
+    fn side_back(&self, card: &Card) -> bool {
+        let Some(host) = host() else {
+            return false;
+        };
+        let Some((side, data)) = host.shared_buffer(card.size) else {
+            return false;
+        };
+        crate::host::name(&side, || format!("title buffer {:#x}+{:#x}, the CPU's side again", self.start, self.len));
+        // What the card holds is title memory as it was sent, and what the
+        // shaders wrote: pages the title wrote since go up at the next
+        // refresh, as the write watch says.
+        crate::host::copy_mapped(data, self.start as *const u8, self.len as usize, false);
+        *card.staging.lock().unwrap_or_else(|e| e.into_inner()) = Some(side);
+        self.data_ptr.store(data, Ordering::Release);
+        self.lean.store(false, Ordering::SeqCst);
+        self.spoiled.store(false, Ordering::Relaxed);
+        BUFFER_LEAN_REFUSED.lock().unwrap_or_else(|e| e.into_inner()).insert(self.start);
+        BUFFER_LEAN[0].fetch_sub(1, Ordering::Relaxed);
+        BUFFER_LEAN[1].fetch_sub(self.len, Ordering::Relaxed);
+        BUFFER_LEAN[6].fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            start = format_args!("{:#x}", self.start),
+            len = self.len,
+            "K6_BUFFER_NO_CPU_SIDE: a title buffer's copy that shaders write has a CPU side again, and keeps it"
+        );
+        true
+    }
 }
 
 /// [`window_card_for`] in the card's own memory.
@@ -911,7 +1188,7 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let mut all: Vec<Arc<Shadow>> = buffers_read().values().filter_map(|e| e.shadow.clone()).collect();
     all.extend(LOOSE.read().unwrap_or_else(|e| e.into_inner()).values().cloned());
-    all.retain(|s| s.place.is_none() && !s.lean && s.watched.load(Ordering::Relaxed) == 1);
+    all.retain(|s| s.place.is_none() && !s.lean() && s.watched.load(Ordering::Relaxed) == 1);
     all.sort_by_key(|s| s.id);
     let next = NEXT.load(Ordering::Relaxed);
     let turn = all.partition_point(|s| s.id < next);
@@ -942,7 +1219,7 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
             done += hi - lo;
             // SAFETY: inside the mapping; nothing is in the air and the
             // submission lock is held.
-            let held = unsafe { std::slice::from_raw_parts(shadow.data.add(lo - start).cast_const(), hi - lo) };
+            let held = unsafe { std::slice::from_raw_parts(shadow.data().add(lo - start).cast_const(), hi - lo) };
             if held == title {
                 continue;
             }
@@ -2085,7 +2362,7 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
             // The snapshot's memory stays until the range is done with
             // (`copy_back_done`), which comes after this.
             match shadow.before.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                Some(before) => (shadow.data as usize, before.as_ptr() as usize, shadow.start as usize, from, to),
+                Some(before) => (shadow.data() as usize, before.as_ptr() as usize, shadow.start as usize, from, to),
                 None => (0, 0, 0, 0, 0),
             }
         })
@@ -3053,9 +3330,10 @@ impl Drop for Shadow {
         if self.mapped {
             WINDOW_MAPPED_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
-        if self.lean {
-            WINDOW_LEAN[0].fetch_sub(1, Ordering::Relaxed);
-            WINDOW_LEAN[1].fetch_sub(self.len, Ordering::Relaxed);
+        if *self.lean.get_mut() {
+            let alive: &[AtomicU64] = if window { &WINDOW_LEAN } else { &BUFFER_LEAN };
+            alive[0].fetch_sub(1, Ordering::Relaxed);
+            alive[1].fetch_sub(self.len, Ordering::Relaxed);
         }
         let prints = self.prints.get_mut().unwrap_or_else(|e| e.into_inner()).len();
         if prints != 0 {
@@ -3358,6 +3636,105 @@ mod lean_tests {
 }
 
 #[cfg(test)]
+mod buffer_lean_tests {
+    use super::{GUARDED, KERNEL_PAGE, LeanAsk, NOT_WATCHED, PAGE, Shadow, buffer_lean_mode, may_go_lean};
+    use std::sync::atomic::Ordering;
+
+    fn ask() -> LeanAsk {
+        LeanAsk {
+            mode: 1,
+            age_ms: 31_000,
+            settle_ms: 30_000,
+            fills: 1,
+            written: false,
+            stores: false,
+            watched: 1,
+            busy: false,
+            refused: false,
+        }
+    }
+
+    #[test]
+    fn the_switch_reads_one_and_two_only() {
+        assert_eq!(buffer_lean_mode(None), 0);
+        assert_eq!(buffer_lean_mode(Some("0")), 0);
+        assert_eq!(buffer_lean_mode(Some(" 1 ")), 1);
+        assert_eq!(buffer_lean_mode(Some("2")), 2);
+        assert_eq!(buffer_lean_mode(Some("yes")), 0);
+    }
+
+    /// A buffer's copy lets its CPU side go only when it is old enough,
+    /// filled once (with 1), never written by shaders nor stored in by
+    /// address, watched, idle and not refused before.
+    #[test]
+    fn only_settled_copies_no_shader_writes_go_without_a_cpu_side() {
+        assert!(may_go_lean(ask()));
+        assert!(may_go_lean(LeanAsk { watched: GUARDED, ..ask() }), "watched by the guards");
+        assert!(!may_go_lean(LeanAsk { mode: 0, ..ask() }), "switch off");
+        assert!(!may_go_lean(LeanAsk { age_ms: 29_999, ..ask() }), "too young");
+        assert!(!may_go_lean(LeanAsk { fills: 2, ..ask() }), "the title keeps writing it, with 1");
+        assert!(may_go_lean(LeanAsk { fills: 50, mode: 2, ..ask() }), "the title keeps writing it, with 2");
+        assert!(may_go_lean(LeanAsk { fills: 0, ..ask() }), "never filled yet");
+        assert!(!may_go_lean(LeanAsk { written: true, mode: 2, ..ask() }), "shaders write it");
+        assert!(!may_go_lean(LeanAsk { stores: true, mode: 2, ..ask() }), "stores by address");
+        assert!(!may_go_lean(LeanAsk { watched: 0, ..ask() }), "watch not asked yet");
+        assert!(!may_go_lean(LeanAsk { watched: NOT_WATCHED, ..ask() }), "not watched");
+        assert!(!may_go_lean(LeanAsk { busy: true, ..ask() }), "pending ranges or a twin");
+        assert!(!may_go_lean(LeanAsk { refused: true, ..ask() }), "had a side back once");
+    }
+
+    /// A copy whose CPU side is let go reads nothing of it from then on:
+    /// what the title changes is marked to go up from title memory, and a
+    /// copy shaders were declared to write, or store in, keeps its side.
+    #[test]
+    fn a_buffer_copy_letting_its_side_go_marks_what_changes_and_keeps_it_when_written() {
+        const PAGES: usize = 4;
+        let room = vec![5u8; (PAGES + 1) * PAGE];
+        let title = room.as_ptr() as usize;
+        let title = title.next_multiple_of(KERNEL_PAGE);
+        let len = PAGES * PAGE;
+        let mut side = vec![0u8; len];
+        let copy = Shadow::unbacked(title as u64, side.as_mut_ptr(), len as u64, true);
+        let card = copy.card.as_ref().unwrap();
+        assert!(!copy.lean());
+        let given = copy.side_off(card).expect("the side");
+        // (A pointer nothing calls: not released.)
+        std::mem::forget(given);
+        assert!(copy.lean() && copy.carded() && !copy.is_window());
+        assert!(copy.card_sides().is_some_and(|(staging, ..)| staging.is_none()));
+        // What a refresh takes is marked, and the side is not written.
+        side.iter_mut().for_each(|b| *b = 0xee);
+        copy.copy(title + 100, title + PAGE + 7);
+        assert_eq!(copy.take_dirty(), [(100, PAGE + 7)]);
+        copy.take_compared(title, title + 2 * PAGE, true, true);
+        assert_eq!(super::joined(copy.take_dirty()), [(0, 2 * PAGE)]);
+        assert!(side.iter().all(|&b| b == 0xee), "the CPU side is not read or written");
+        let gpu = vec![9u8; 64];
+        let mut scratch = Vec::new();
+        assert_eq!(copy.card_merge(0, &gpu, &mut scratch), 0);
+        assert!(copy.card_held(0, 64).is_empty());
+        // Stores by address: marked to get a side back.
+        assert!(!copy.spoiled.load(Ordering::Relaxed));
+        copy.keep_stores();
+        assert!(copy.spoiled.load(Ordering::Relaxed));
+        assert!(room.iter().all(|&b| b == 5), "title memory untouched");
+
+        // Written before the side would go: it stays.
+        let mut side = vec![0u8; len];
+        let written = Shadow::unbacked(title as u64, side.as_mut_ptr(), len as u64, true);
+        written.written.store(true, Ordering::SeqCst);
+        assert!(written.side_off(written.card.as_ref().unwrap()).is_none());
+        assert!(!written.lean());
+        // (Looked at in place: a clone would call the pointer.)
+        assert!(written.card.as_ref().unwrap().staging.lock().unwrap().is_some());
+        let stores = Shadow::unbacked(title as u64, side.as_mut_ptr(), len as u64, true);
+        stores.keep_stores();
+        assert!(stores.side_off(stores.card.as_ref().unwrap()).is_none());
+        assert!(!stores.lean() && !stores.spoiled.load(Ordering::Relaxed));
+    }
+}
+
+#[cfg(test)]
 mod parts_tests {
     use super::{PAGE, by_parts};
 
@@ -3628,6 +4005,9 @@ pub(crate) enum Lies {
     PcMemory,
     /// In the card's memory, with a CPU side in the PC's memory.
     CardWithCpuSide,
+    /// In the card's memory with no CPU side: what changes goes up from
+    /// title memory (`K6_WINDOW_NO_CPU_SIDE`, `K6_BUFFER_NO_CPU_SIDE`).
+    CardNoCpuSide,
     /// In the card's memory, mapped by the CPU (`GPU_UPLOAD`).
     CardMapped,
 }
@@ -3661,6 +4041,8 @@ pub(crate) fn census_rows() -> Vec<CopyRow> {
             Lies::InPlace
         } else if s.mapped {
             Lies::CardMapped
+        } else if s.card.is_some() && s.lean() {
+            Lies::CardNoCpuSide
         } else if s.card.is_some() {
             Lies::CardWithCpuSide
         } else {
@@ -3670,7 +4052,7 @@ pub(crate) fn census_rows() -> Vec<CopyRow> {
             len: s.len,
             window: s.window,
             lies,
-            cpu_side: s.card.as_ref().map_or(0, |c| c.size),
+            cpu_side: s.card.as_ref().filter(|_| !s.lean()).map_or(0, |c| c.size),
             fills: s.moved[0].load(Ordering::Relaxed),
             bytes_in: s.moved[1].load(Ordering::Relaxed),
             shader_written: s.written.load(Ordering::Relaxed),
@@ -3767,9 +4149,9 @@ impl Shadow {
     fn lean_window(buffer: ID3D12Resource, gpu: u64, start: u64, len: u64) -> Shadow {
         let mut shadow = Shadow::new(buffer, std::ptr::null_mut(), gpu, start, len);
         shadow.window = true;
-        shadow.lean = true;
+        *shadow.lean.get_mut() = true;
         shadow.card = Some(Card {
-            staging: None,
+            staging: Mutex::new(None),
             before: Mutex::default(),
             dirty: Mutex::default(),
             sent: Mutex::default(),
@@ -3803,7 +4185,7 @@ impl Shadow {
             landing: Default::default(),
             width: Default::default(),
             buffer,
-            data,
+            data_ptr: std::sync::atomic::AtomicPtr::new(data),
             gpu,
             start,
             len,
@@ -3832,8 +4214,10 @@ impl Shadow {
             place: None,
             #[cfg(feature = "diagnostics")]
             moved: Default::default(),
-            lean: false,
+            lean: std::sync::atomic::AtomicBool::new(false),
             spoiled: std::sync::atomic::AtomicBool::new(false),
+            made: crate::host::now_ms(),
+            fills: AtomicU64::new(0),
         }
     }
 
@@ -3862,25 +4246,15 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
-        if self.lean {
-            // No CPU side to bring what shaders write back by
-            // (`window_no_cpu_side`): dropped, said once, and the window
-            // gives way to one with a CPU side at the next ask.
-            WINDOW_LEAN[3].fetch_add(1, Ordering::Relaxed);
-            if !self.spoiled.swap(true, Ordering::Relaxed) {
-                static SAID: AtomicU64 = AtomicU64::new(0);
-                let said = SAID.fetch_add(1, Ordering::Relaxed);
-                if said < 16 || said.is_power_of_two() {
-                    tracing::warn!(
-                        start = format_args!("{:#x}", self.start),
-                        len = self.len,
-                        address = format_args!("{address:#x}"),
-                        write_len = len,
-                        "K6_WINDOW_NO_CPU_SIDE: shaders were declared to write a window with no CPU side; the write stays on \
-                         the card and the window is made again with a CPU side"
-                    );
-                }
-            }
+        // A buffer's copy may let its CPU side go at the sweep
+        // (`buffer_no_cpu_side`), which looks at `written` after it says
+        // `lean`: each side stores before it loads, so one of the two sees
+        // the other.
+        if !self.window {
+            self.written.store(true, Ordering::SeqCst);
+        }
+        if self.lean.load(Ordering::SeqCst) {
+            self.spoil(address, len, "shaders were declared to write it");
             return;
         }
         self.written.store(true, Ordering::Relaxed);
@@ -3898,7 +4272,7 @@ impl Shadow {
     /// frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
         // (A window with no CPU side declares nothing: `gpu_writes`.)
-        if self.place.is_some() || self.lean {
+        if self.place.is_some() || self.lean() {
             return;
         }
         // A window with no card side compares nothing from here on
@@ -3975,7 +4349,7 @@ impl Shadow {
                     let (lo, hi) = (lo.max(from), hi.min(to));
                     // SAFETY: as below; `hi <= total`.
                     unsafe {
-                        std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                        std::ptr::copy_nonoverlapping(self.data().add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
                     }
                     kept.0[piece] = whole;
                 }
@@ -3989,7 +4363,7 @@ impl Shadow {
             // then. The snapshot's memory stays where it is until the
             // range is done with (`copy_back_done`).
             let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
-            let (data, snapshot) = (self.data as usize, snapshot.as_mut_ptr() as usize);
+            let (data, snapshot) = (self.data() as usize, snapshot.as_mut_ptr() as usize);
             snaps.extend(parts.into_iter().filter(|&(from, to)| from < to).map(|(from, to)| (data + from, snapshot + from, to - from)));
             return;
         }
@@ -3998,7 +4372,7 @@ impl Shadow {
                 // SAFETY: the copy's mapping and the snapshot's allocation
                 // (`pooled`) both hold `total` bytes, and `to <= total`.
                 unsafe {
-                    copy_wide(self.data.add(from), snapshot.as_mut_ptr().add(from), to - from);
+                    copy_wide(self.data().add(from), snapshot.as_mut_ptr().add(from), to - from);
                 }
             }
         }
@@ -4070,7 +4444,7 @@ impl Shadow {
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                let host = unsafe { std::slice::from_raw_parts_mut(self.data().add(at), n) };
                 let old = &before[at - from..at - from + n];
                 let read = |first: usize, title: &mut [u8]| crate::host::read_into((start + at + first) as *const u8, title);
                 let Some((first, n)) = back_piece(host, old, &mut title, &mut mask, &mut runs, read) else {
@@ -4143,7 +4517,7 @@ impl Shadow {
         // room just reserved; the card may write the mapping meanwhile, and
         // each byte read is one it held at some moment.
         unsafe {
-            std::ptr::copy_nonoverlapping(self.data.add(at), now.as_mut_ptr(), n);
+            std::ptr::copy_nonoverlapping(self.data().add(at), now.as_mut_ptr(), n);
             now.set_len(n);
         }
         // SAFETY: the snapshot's allocation holds the copy's length
@@ -4176,7 +4550,7 @@ impl Shadow {
     /// `from` on), as (offset, bytes) in order; compared on several threads
     /// when the range is big.
     fn differing(&self, from: usize, to: usize, before: &[u8]) -> Vec<(usize, usize)> {
-        let (start, data) = (self.start as usize, self.data as usize);
+        let (start, data) = (self.start as usize, self.data() as usize);
         let scan = |a: usize, b: usize| -> Vec<(usize, usize)> {
             let mut found = Vec::new();
             let mut at = a;
@@ -4424,7 +4798,7 @@ impl Shadow {
             let merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
             let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
             let held = if self.card.is_some() {
-                self.data as usize
+                self.data() as usize
             } else {
                 before.as_mut().map_or(0, |snapshot| snapshot.as_mut_ptr() as usize)
             };
@@ -4595,7 +4969,7 @@ impl Shadow {
                 // SAFETY: inside the copy's mapping. The card may be
                 // writing the copy beside these bytes; they are
                 // written here and nothing around them.
-                unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
+                unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data().add(at + r), m) };
                 held[r..r + m].copy_from_slice(&title[r..r + m]);
             }
             Ok(Some(runs))
@@ -4607,6 +4981,9 @@ impl Shadow {
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
         let bytes = self.update_inner(address, len);
+        if bytes > 0 {
+            self.fills.fetch_add(1, Ordering::Relaxed);
+        }
         #[cfg(feature = "diagnostics")]
         if bytes > 0 {
             self.moved[0].fetch_add(1, Ordering::Relaxed);
@@ -4735,7 +5112,7 @@ impl Shadow {
     /// title's that arrived between the refresh and the look.
     fn refresh_check(&self, from: usize, to: usize) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1")) || self.lean {
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1")) || self.lean() {
             return;
         }
         const SAMPLE: usize = 256;
@@ -4750,7 +5127,7 @@ impl Shadow {
             if crate::host::read_into(at as *const u8, &mut title[..n]) {
                 // SAFETY: `[from, to)` lies inside the buffer (`update`),
                 // so these bytes are inside the copy's mapping.
-                let copy = unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), n) };
+                let copy = unsafe { std::slice::from_raw_parts(self.data().add(at - start).cast_const(), n) };
                 let mut map = DIFFERING.lock().unwrap_or_else(|e| e.into_inner());
                 let map = map.get_or_insert_with(Default::default);
                 if copy == &title[..n] {
@@ -4943,7 +5320,7 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side, which
                     // nothing else reads or writes there: no shader's range
                     // holds it, and the parts of a refresh lie apart.
-                    let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), next - at) };
+                    let held = unsafe { std::slice::from_raw_parts_mut(self.data().add(at - start), next - at) };
                     if title == held {
                         ECHO[0].fetch_add((next - at) as u64, Ordering::Relaxed);
                     } else {
@@ -4972,7 +5349,7 @@ impl Shadow {
             /// A page of title memory, as read.
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
-        if self.lean {
+        if self.lean() {
             // Nothing to compare with: all of it goes up, from title memory.
             return self.copy(from, to);
         }
@@ -4996,7 +5373,7 @@ impl Shadow {
                 // nothing else reads or writes there (the card copies from
                 // it): no shader's range holds it, and the parts of a
                 // refresh lie apart.
-                let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), n) };
+                let held = unsafe { std::slice::from_raw_parts_mut(self.data().add(at - start), n) };
                 let was = crate::host::upcheck::on().then(|| held.to_vec());
                 let runs = if whole { vec![(0, n)] } else { dword_runs(at, held, title, 0) };
                 for &(a, len) in &runs {
@@ -5023,7 +5400,7 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
-        if self.lean {
+        if self.lean() {
             // No CPU side: it goes up from title memory (`host::send::take`).
             if from < to {
                 self.card_changed(from - start, to - start);
@@ -5036,12 +5413,12 @@ impl Shadow {
             return to - from;
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
-        let at = unsafe { self.data.add(from - start) };
+        let at = unsafe { self.data().add(from - start) };
         if self.card.is_some() && from < to && crate::host::upcheck::on() {
             for_pieces_of(from - start, to - start, |a, b| {
                 let was = self.card_held(a, b - a);
                 // SAFETY: inside the mapping, as above.
-                crate::host::copy_mapped(unsafe { self.data.add(a) }, (start + a) as *const u8, b - a, false);
+                crate::host::copy_mapped(unsafe { self.data().add(a) }, (start + a) as *const u8, b - a, false);
                 crate::host::upcheck::note(self.id, a, &was, &self.card_held(a, b - a));
             });
         } else {
@@ -5116,7 +5493,7 @@ impl Shadow {
                     // a window's buffer while a refresh has it (no shader
                     // writes one that compares, and a refresh is one
                     // thread's).
-                    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(at - start), bytes.len()) };
+                    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data().add(at - start), bytes.len()) };
                     // After the bytes are in: a snapshot taken meanwhile is
                     // not current.
                     self.changed(at - start, at - start + bytes.len());
@@ -5151,14 +5528,55 @@ impl Shadow {
     /// Whether it is a window in the card's memory with no CPU side
     /// ([`window_no_cpu_side`]): what changed goes up from title memory, and
     /// nothing a shader writes in it can be brought back.
+    /// Whether it is a window of title memory outside buffers.
+    pub(crate) fn is_window(&self) -> bool {
+        self.window
+    }
+
     pub(crate) fn lean(&self) -> bool {
-        self.lean
+        self.lean.load(Ordering::Acquire)
+    }
+
+    /// What the CPU side maps (see the field).
+    fn data(&self) -> *mut u8 {
+        self.data_ptr.load(Ordering::Acquire)
     }
 
     /// Shaders store in it what is not declared: from here on only the dwords
     /// the title changes go up ([`by_address`]).
     pub(crate) fn keep_stores(&self) {
-        self.changes_only.store(true, Ordering::Relaxed);
+        // (Before `lean` is looked at, as in `gpu_writes`.)
+        self.changes_only.store(true, Ordering::SeqCst);
+        if !self.window && self.lean.load(Ordering::SeqCst) {
+            self.spoil(self.start, self.len, "shaders store in it by address");
+        }
+    }
+
+    /// A copy with no CPU side that shaders write ([`window_no_cpu_side`],
+    /// [`buffer_no_cpu_side`]): nothing brings the write back to title
+    /// memory. Said (the first 16, then at powers of two); a window gives way
+    /// to one with a CPU side at the next ask ([`loose`]), a buffer's copy
+    /// gets its CPU side back at the next sweep ([`settle_lean_buffers`]).
+    fn spoil(&self, address: u64, len: u64, why: &str) {
+        let (count, switch, then) = if self.window {
+            (&WINDOW_LEAN[3], "K6_WINDOW_NO_CPU_SIDE", "the window is made again with a CPU side")
+        } else {
+            (&BUFFER_LEAN[4], "K6_BUFFER_NO_CPU_SIDE", "the buffer's copy gets its CPU side back at the next sweep")
+        };
+        count.fetch_add(1, Ordering::Relaxed);
+        if !self.spoiled.swap(true, Ordering::Relaxed) {
+            static SAID: AtomicU64 = AtomicU64::new(0);
+            let said = SAID.fetch_add(1, Ordering::Relaxed);
+            if said < 16 || said.is_power_of_two() {
+                tracing::warn!(
+                    start = format_args!("{:#x}", self.start),
+                    len = self.len,
+                    address = format_args!("{address:#x}"),
+                    write_len = len,
+                    "{switch}: {why}, and it has no CPU side; what they write stays on the card and {then}"
+                );
+            }
+        }
     }
 
     /// Offsets `[from, to)` go up again whole, as the CPU's side has them.
@@ -5209,7 +5627,7 @@ impl Shadow {
     /// is declared written by it, and its sends are taken.
     pub(crate) fn placed_copy(&self, address: usize, bytes: &[u8]) {
         let (from, to) = self.inside(address, bytes.len());
-        if from >= to || self.place.is_some() || self.lean {
+        if from >= to || self.place.is_some() || self.lean() {
             return;
         }
         let bytes = &bytes[self.start as usize + from - address..][..to - from];
@@ -5217,7 +5635,7 @@ impl Shadow {
         if self.card.is_some() {
             // SAFETY: inside the mapping of the CPU's side, in a range no
             // refresh writes; the lock keeps the landing out.
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(from), bytes.len()) };
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data().add(from), bytes.len()) };
         } else if let Some(snapshot) = self.before.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             // SAFETY: the snapshot's allocation holds the copy's length.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), snapshot.as_mut_ptr().add(from), bytes.len()) };
@@ -5227,19 +5645,19 @@ impl Shadow {
 
     /// Of a copy in the card's memory: where its CPU side is.
     pub(crate) fn card_data(&self) -> *const u8 {
-        self.data
+        self.data()
     }
 
     /// Diagnostics: of a copy in the card's memory, what its CPU side holds
     /// at offsets `[at, at + len)` (cut to the copy).
     pub(crate) fn card_held(&self, at: usize, len: usize) -> Vec<u8> {
         let to = (at + len).min(self.len as usize);
-        if self.card.is_none() || self.lean || at >= to {
+        if self.card.is_none() || self.lean() || at >= to {
             return Vec::new();
         }
         // SAFETY: inside the mapping; the caller holds the submission lock,
         // under which it is written but for what is being landed.
-        unsafe { std::slice::from_raw_parts(self.data.add(at).cast_const(), to - at) }.to_vec()
+        unsafe { std::slice::from_raw_parts(self.data().add(at).cast_const(), to - at) }.to_vec()
     }
 
     /// Diagnostics: the offsets whose bytes have not gone to the card's side
@@ -5250,10 +5668,11 @@ impl Shadow {
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
     /// card side's bytes from before if made yet, and their size.
-    pub(crate) fn card_sides(&self) -> Option<(Option<&ID3D12Resource>, Option<ID3D12Resource>, u64)> {
+    pub(crate) fn card_sides(&self) -> Option<(Option<ID3D12Resource>, Option<ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        Some((card.staging.as_ref(), before, card.size))
+        let staging = card.staging.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        Some((staging, before, card.size))
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes
@@ -5369,12 +5788,12 @@ impl Shadow {
     /// Returns the bytes written to title memory.
     pub(crate) fn card_merge(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
-        if self.card.is_none() || self.lean || at + gpu.len() > self.len as usize {
+        if self.card.is_none() || self.lean() || at + gpu.len() > self.len as usize {
             return 0;
         }
         // SAFETY: inside the mapping (checked above); only the submitting
         // thread writes it.
-        let old = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
+        let old = unsafe { std::slice::from_raw_parts_mut(self.data().add(at), gpu.len()) };
         let Some(first) = first_difference(gpu, old) else {
             return 0;
         };
@@ -5434,7 +5853,7 @@ impl Shadow {
         let Some(card) = &self.card else {
             return 0;
         };
-        if self.lean || at + gpu.len() > self.len as usize {
+        if self.lean() || at + gpu.len() > self.len as usize {
             return 0;
         }
         let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -5442,7 +5861,7 @@ impl Shadow {
         // range declared and not done with, which no refresh writes; what
         // does write it (the title's bytes put in under shader writes)
         // holds the lock held here.
-        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
+        let held = unsafe { std::slice::from_raw_parts_mut(self.data().add(at), gpu.len()) };
         let Some(first) = first_difference(gpu, held) else {
             return 0;
         };
@@ -5485,7 +5904,7 @@ impl Shadow {
         let mut shadow = Shadow::new(none(), data, 0, start, len);
         if card {
             shadow.card = Some(Card {
-                staging: Some(none()),
+                staging: Mutex::new(Some(none())),
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
@@ -5548,7 +5967,7 @@ impl Shadow {
     /// The third of each piece is the address of its bytes, which stay as
     /// they are during the call.
     pub(crate) unsafe fn land_card(&self, pieces: &[(usize, usize, usize)], fetched_after: u64, notes: &mut crate::land::Notes) -> u64 {
-        let Some(card) = self.card.as_ref().filter(|_| !self.lean) else {
+        let Some(card) = self.card.as_ref().filter(|_| !self.lean()) else {
             return 0;
         };
         let waiting = std::time::Instant::now();
@@ -5575,7 +5994,7 @@ impl Shadow {
             // Where title memory is not mapped the CPU's side keeps what
             // the card wrote, as before.
             let merged =
-                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), &parts, true, notes, self) };
+                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data().add(lo), &parts, true, notes, self) };
             self.walls_merged(hi - lo, merged as usize);
             if merged > 0 {
                 self.note_landing(lo, hi);
@@ -5610,7 +6029,7 @@ impl Shadow {
         // keeps out what else writes them. Title memory that is not there
         // is looked at again when the next flight that declared the range
         // lands.
-        unsafe { crate::land::piece(self.start as usize + at, self.data.add(at), held.add(at), &[(0, n)], false, notes, self) }
+        unsafe { crate::land::piece(self.start as usize + at, self.data().add(at), held.add(at), &[(0, n)], false, notes, self) }
     }
 
     /// What shaders wrote in 64 KiB block `block` (of title memory) of this
@@ -5654,7 +6073,7 @@ mod land_tests {
         unsafe { std::ptr::write_bytes(data, 0, len) };
         let mut shadow = Shadow::new(buffer.clone(), data, 0, title as u64, len as u64);
         shadow.card = Some(Card {
-            staging: Some(buffer),
+            staging: Mutex::new(Some(buffer)),
             before: Mutex::default(),
             dirty: Mutex::default(),
             sent: Mutex::default(),
@@ -5731,7 +6150,7 @@ mod land_tests {
                 for (shadow, at) in [(&one, a), (&many, b)] {
                     crate::watch::writing(at, LEN);
                     bytes(at).copy_from_slice(&title);
-                    bytes(shadow.data as usize).copy_from_slice(&held);
+                    bytes(shadow.data() as usize).copy_from_slice(&held);
                     let card = shadow.card.as_ref().expect("made with one");
                     *card.dirty.lock().unwrap() = dirty.clone();
                     *card.sent.lock().unwrap() = super::SentRuns::of(&sent);
@@ -5748,7 +6167,7 @@ mod land_tests {
                 unsafe { many.land_card(&addressed, after, &mut notes) };
                 notes.flush();
                 assert!(bytes(a) == bytes(b), "title memory, round {round}");
-                assert!(bytes(one.data as usize) == bytes(many.data as usize), "the CPU's side, round {round}");
+                assert!(bytes(one.data() as usize) == bytes(many.data() as usize), "the CPU's side, round {round}");
             }
         }
     }
@@ -6075,7 +6494,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     "a buffer's host copy is in the card's memory"
                 );
                 let card = Card {
-                    staging: Some(buffer),
+                    staging: Mutex::new(Some(buffer)),
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
@@ -6303,7 +6722,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     shadow.window = true;
     shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card {
-        staging: Some(staging),
+        staging: Mutex::new(Some(staging)),
         before: Mutex::default(),
         dirty: Mutex::default(),
         sent: Mutex::default(),
@@ -6539,7 +6958,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         Some(on_card) => {
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {
-                staging: Some(buffer),
+                staging: Mutex::new(Some(buffer)),
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
@@ -6643,7 +7062,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
                 let held: usize = pool.values().map(Vec::len).sum();
                 if held < 1024 {
                     let bytes = shadow.len.next_multiple_of(256);
-                    pool.entry(bytes).or_default().push((shadow.buffer.clone(), shadow.data as usize));
+                    pool.entry(bytes).or_default().push((shadow.buffer.clone(), shadow.data() as usize));
                 }
             }
         }

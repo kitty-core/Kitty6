@@ -566,6 +566,9 @@ fn sweep() {
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
+    // Buffers' copies on the card let their CPU side go, or get it back
+    // (`K6_BUFFER_NO_CPU_SIDE`): nothing is in the air or being prepared.
+    crate::shadow::settle_lean_buffers();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
     crate::list::trim_idle();
@@ -4109,11 +4112,12 @@ fn late_line(frames: f64) {
             let t: Vec<f64> = send::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
             tracing::info!(
                 "bytes of submissions' own sent up per frame (VICTORY_SEND_OWN): {:.1} MB in {:.0} runs, {:.0} words in scatters; {:.2} ms \
-                 taking them out of the CPU sides",
+                 taking them out of the CPU sides; {} MB of spare memory for them kept (K6_SEND_SPARE_S)",
                 t[0] / (1 << 20) as f64,
                 t[1],
                 t[2],
                 t[3] / 1000.0,
+                send::spare_bytes() >> 20,
             );
         }
         let t: Vec<f64> = torn::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -4898,7 +4902,7 @@ impl Host {
                         let mut ranges: Vec<upq::Range<'_>> = Vec::new();
                         for ((shadow, rs), side) in dirty.iter().zip(&sides) {
                             if let Some((Some(staging), _, _)) = side {
-                                ranges.extend(rs.iter().map(|&(a, b)| (&shadow.buffer, a as u64, *staging, (b - a) as u64)));
+                                ranges.extend(rs.iter().map(|&(a, b)| (&shadow.buffer, a as u64, staging, (b - a) as u64)));
                             }
                         }
                         up = upq::send(self, &self.queue, &ranges, |i, bounce, at| {
@@ -4912,7 +4916,7 @@ impl Host {
                         };
                         if own.is_none()
                             && up.is_none()
-                            && let Some(staging) = staging
+                            && let Some(staging) = &staging
                         {
                             for &(a, b) in ranges {
                                 list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);

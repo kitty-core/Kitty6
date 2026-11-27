@@ -916,6 +916,19 @@ fn log_memory() {
             mb(sides[4]),
             sides[5],
         );
+        let b = crate::shadow::buffer_sides();
+        tracing::info!(
+            "title buffers' copies in the card's memory with no CPU side (K6_BUFFER_NO_CPU_SIDE): {} now {:.0} MB (not held in \
+             the PC's memory); since the start {} let it go ({:.0} MB), {:.0} MB sent to them straight from title memory, {} \
+             shader writes declared for them and dropped, {} given a CPU side back",
+            b[0],
+            mb(b[1]),
+            b[2],
+            mb(b[3]),
+            mb(b[5]),
+            b[4],
+            b[6],
+        );
     }
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \

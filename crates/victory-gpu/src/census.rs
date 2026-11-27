@@ -198,6 +198,7 @@ pub(crate) fn copy_bytes(row: &CopyRow) -> (u64, u64) {
         Lies::InPlace => (0, 0),
         Lies::PcMemory => (row.len, 0),
         Lies::CardWithCpuSide => (row.cpu_side, row.cpu_side),
+        Lies::CardNoCpuSide => (0, row.len),
         Lies::CardMapped => (0, row.len),
     }
 }
@@ -321,7 +322,7 @@ fn take() -> Vec<String> {
             lines.push(line(&format!("buffers, {what}"), s));
         }
     }
-    let by_lies = [Lies::PcMemory, Lies::CardWithCpuSide, Lies::CardMapped, Lies::InPlace].map(|lies| {
+    let by_lies = [Lies::PcMemory, Lies::CardWithCpuSide, Lies::CardNoCpuSide, Lies::CardMapped, Lies::InPlace].map(|lies| {
         let rows = copies.iter().filter(|r| r.lies == lies);
         let (n, bytes) = rows.fold((0u64, 0u64), |a, r| (a.0 + 1, a.1 + r.len));
         (lies, n, bytes)
@@ -456,6 +457,7 @@ mod tests {
     fn copies_count_where_their_bytes_lie() {
         assert_eq!(copy_bytes(&copy(Lies::PcMemory, 1, false)), (4 << 20, 0));
         assert_eq!(copy_bytes(&copy(Lies::CardWithCpuSide, 1, false)), (4 << 20, 4 << 20));
+        assert_eq!(copy_bytes(&copy(Lies::CardNoCpuSide, 1, false)), (0, 4 << 20), "no CPU side: the card's alone");
         assert_eq!(copy_bytes(&copy(Lies::CardMapped, 1, false)), (0, 4 << 20));
         assert_eq!(copy_bytes(&copy(Lies::InPlace, 1, false)), (0, 0));
     }

@@ -748,6 +748,10 @@ impl Host {
             let to = match does[i] {
                 Does::Copy { .. } => {
                     let to = holder(&writers, dst, dst + len)?;
+                    // (A copy with no CPU side cannot bring a write back.)
+                    if to.lean() {
+                        return Err("what it writes has no CPU side");
+                    }
                     if elsewhere(&does, Arc::as_ptr(&to) as usize, dst, dst + len) {
                         return Err("another host copy of what it writes is read");
                     }

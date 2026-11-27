@@ -117,6 +117,8 @@ pub(super) struct Memory {
     buffer: ID3D12Resource,
     data: usize,
     size: u64,
+    /// When it was last given back ([`now_ms`]).
+    back: u64,
 }
 
 // SAFETY: a D3D12 object (free-threaded) and its mapping, with one owner.
@@ -130,6 +132,46 @@ static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 /// more of RAM is worth more than a few allocations).
 fn kept() -> u64 {
     if on_card() || crate::residency::limited_host_ram() { 256 << 20 } else { 768 << 20 }
+}
+
+/// How long spare memory nothing took is kept (`K6_SEND_SPARE_S`, seconds;
+/// unset or 0: as long as [`kept`] allows, as before).
+///
+/// What a submission sends differs from frame to frame, and memory is made
+/// by doubles of 8 MB and more: a burst (the world loading, a cut) leaves
+/// pieces of 256 or 512 MB in the spare list, which [`memory`] hands out to
+/// anything they fit and so never lets go. Upload memory is private memory
+/// of the process. With the switch, a piece not taken for this long is let
+/// go when memory is given back or asked for; what steady frames reuse is
+/// taken every frame and stays, so the cost is at most a new allocation
+/// after a pause.
+fn spare_idle_ms() -> Option<u64> {
+    static MS: OnceLock<Option<u64>> = OnceLock::new();
+    *MS.get_or_init(|| {
+        let s = std::env::var("K6_SEND_SPARE_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&s| s > 0);
+        if let Some(s) = s {
+            tracing::info!(seconds = s, "K6_SEND_SPARE_S: spare memory for submissions' sends let go when not taken for this long");
+        }
+        s.map(|s| s * 1000)
+    })
+}
+
+/// Of `spare` (largest first), what stays: none not given back since
+/// `idle_ms` before `now`, and of the rest no more than `most` bytes, the
+/// largest let go first. `size` and `back` say each one's bytes and when
+/// it was given back. Pure.
+fn trim<T>(spare: &mut Vec<T>, size: impl Fn(&T) -> u64, back: impl Fn(&T) -> u64, now: u64, idle_ms: Option<u64>, most: u64) {
+    if let Some(idle) = idle_ms {
+        spare.retain(|m| now.saturating_sub(back(m)) <= idle);
+    }
+    while spare.iter().map(&size).sum::<u64>() > most {
+        spare.remove(0);
+    }
+}
+
+/// Bytes of spare memory kept now (for the frame line).
+pub(super) fn spare_bytes() -> u64 {
+    SPARE.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|m| m.size).sum()
 }
 
 /// Whether the memory lies in the card's memory, written by the CPU through
@@ -147,6 +189,9 @@ fn on_card() -> bool {
 fn memory(host: &Host, size: u64) -> Option<Memory> {
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        if spare_idle_ms().is_some() {
+            trim(&mut spare, |m| m.size, |m| m.back, now_ms(), spare_idle_ms(), kept());
+        }
         let fit = spare.iter().enumerate().filter(|(_, m)| m.size >= size).min_by_key(|(_, m)| m.size).map(|(i, _)| i);
         if let Some(i) = fit {
             return Some(spare.swap_remove(i));
@@ -165,16 +210,41 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
         buffer,
         data: data as usize,
         size,
+        back: 0,
     })
 }
 
 /// The submission has run.
-pub(super) fn give_back(memory: Memory) {
+pub(super) fn give_back(mut memory: Memory) {
+    let now = now_ms();
+    memory.back = now;
     let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
     spare.push(memory);
     spare.sort_by_key(|m| std::cmp::Reverse(m.size));
-    while spare.iter().map(|m| m.size).sum::<u64>() > kept() {
-        spare.remove(0);
+    trim(&mut spare, |m| m.size, |m| m.back, now, spare_idle_ms(), kept());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trim;
+
+    /// (bytes, given back at)
+    fn left(mut spare: Vec<(u64, u64)>, now: u64, idle: Option<u64>, most: u64) -> Vec<(u64, u64)> {
+        trim(&mut spare, |m| m.0, |m| m.1, now, idle, most);
+        spare
+    }
+
+    #[test]
+    fn spare_memory_goes_when_too_much_or_with_the_switch_when_not_taken() {
+        let spare = vec![(512, 1_000), (128, 9_000), (64, 9_500)];
+        // As before: only what is over the most, the largest first.
+        assert_eq!(left(spare.clone(), 10_000, None, 768), spare);
+        assert_eq!(left(spare.clone(), 10_000, None, 256), [(128, 9_000), (64, 9_500)]);
+        // With the switch: the burst's piece not taken for 9 s goes.
+        assert_eq!(left(spare.clone(), 10_000, Some(5_000), 768), [(128, 9_000), (64, 9_500)]);
+        assert_eq!(left(spare.clone(), 10_000, Some(9_000), 768), spare, "given back 9 s ago: stays");
+        assert_eq!(left(spare.clone(), 20_000, Some(5_000), 768), []);
+        assert_eq!(left(Vec::new(), 0, Some(1), 0), []);
     }
 }
 
@@ -229,12 +299,15 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     let memory = memory(host, at)?;
     let mut moves: Vec<(usize, usize, usize)> = Vec::new();
     let mut title_moves: Vec<(usize, usize, usize)> = Vec::new();
+    // Of those, the bytes that go to windows and to buffers' copies.
+    let mut title_bytes = [0u64; 2];
     let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
     for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
         if shadow.lean() {
             // (Its offsets are title addresses from its start on.)
             let from = shadow.span().0 as usize;
             title_moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
+            title_bytes[usize::from(!shadow.is_window())] += copy.runs.iter().map(|r| r.2 as u64).sum::<u64>();
             continue;
         }
         let from = shadow.card_data() as usize;
@@ -272,6 +345,7 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
     crate::shadow::copy_all(moves);
     crate::shadow::copy_title_all(title_moves);
+    crate::shadow::note_title_sends(title_bytes[0], title_bytes[1]);
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     Some(Own { memory, copies, used: at })
 }
