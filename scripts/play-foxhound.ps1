@@ -64,6 +64,8 @@ $settings = @{
     VICTORY_LEAVE_OUT = '02384a60fda6f2d0,731a39171b568298'
     # Pipelines the title makes are written down, so `victory warm` can make them ahead
     VICTORY_PIPELINE_BOOK = '1'
+    # Kitty6: game time keeps real time down to 8 fps (the title steps at most 1/15 s a frame: slow motion below 15 fps)
+    K6_MAX_STEP_MS = '125'
 }
 if (-not $SeriesS) {
     if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }

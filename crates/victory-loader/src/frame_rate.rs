@@ -224,9 +224,92 @@ pub unsafe fn apply(base: usize, size: usize, rate: u32, sites: &[Site]) -> Vec<
         .collect()
 }
 
+/// The game's longest step (`K6_MAX_STEP_MS=<ms>`, off without it). +0x2226040
+/// makes each timer's step of the real time since the last frame, at most
+/// `[+0x6159ec0]`, 1/15 s (`vmovss xmm3, [rip+..]` at +0x2226045, then
+/// `vminss`). Below 15 frames a second every frame still moves the game only
+/// 66.7 ms: at 12 fps it runs at 80% speed, at 8 fps at half. Here that one
+/// load reads another read-only constant of the title instead, the longest
+/// of [`STEP_CONSTANTS`] not over the time asked for, so game time follows
+/// real time down to that frame rate. The constant itself is shared code's and
+/// is left alone. The instruction's bytes and the chosen constant's are both
+/// compared first.
+pub const MAX_STEP_SITE: usize = 0x2226045;
+/// `vmovss xmm3, dword [rip+0x3f33e73]` (to +0x6159ec0).
+pub const MAX_STEP_BYTES: [u8; 8] = [0xc5, 0xfa, 0x10, 0x1d, 0x73, 0x3e, 0xf3, 0x03];
+/// Read-only floats of the title (`.rdata`, 1.0.2.1): (seconds, image offset).
+pub const STEP_CONSTANTS: [(f32, usize); 5] =
+    [(0.1, 0x5fc7020), (0.125, 0x615a6b8), (0.2, 0x6159f8c), (0.25, 0x6159ca4), (1.0 / 3.0, 0x615a240)];
+
+/// `K6_MAX_STEP_MS`: the longest step asked for, in seconds; `None` unset or
+/// not above 1/15 s.
+pub fn asked_max_step() -> Option<f32> {
+    let ms = std::env::var("K6_MAX_STEP_MS").ok()?.trim().parse::<f32>().ok()?;
+    (ms > 1000.0 / 15.0 + 0.5).then_some(ms / 1000.0)
+}
+
+/// The constant to read for a longest step of `secs`: the longest one not over it.
+pub fn step_constant(secs: f32) -> Option<(f32, usize)> {
+    STEP_CONSTANTS.iter().copied().filter(|(v, _)| *v <= secs + 1e-6).last()
+}
+
+/// Points the step's load at the chosen constant ([`MAX_STEP_SITE`]); the
+/// longest step now taken, or why not.
+///
+/// # Safety
+/// `base` is the title's mapped image of `size` bytes, none of it running yet.
+#[cfg(windows)]
+pub unsafe fn apply_max_step(base: usize, size: usize, secs: f32) -> Result<f32, &'static str> {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let (value, at_const) = step_constant(secs).ok_or("no constant that short")?;
+    if MAX_STEP_SITE + 8 > size || at_const + 4 > size {
+        return Err("outside the image");
+    }
+    let at = base + MAX_STEP_SITE;
+    // SAFETY: inside the mapped image (checked above).
+    let there = unsafe { std::slice::from_raw_parts(at as *const u8, 8) };
+    if there != MAX_STEP_BYTES {
+        return Err("the title's bytes there are not the ones expected (another build?)");
+    }
+    // SAFETY: inside the mapped image (checked above).
+    let found = unsafe { std::ptr::read_unaligned((base + at_const) as *const f32) };
+    if found.to_bits() != value.to_bits() {
+        return Err("the constant is not where expected (another build?)");
+    }
+    // rip-relative: the displacement counts from the end of the 8-byte instruction.
+    let disp = i32::try_from(at_const as i64 - (MAX_STEP_SITE as i64 + 8)).map_err(|_| "too far")?;
+    let mut code = MAX_STEP_BYTES;
+    code[4..8].copy_from_slice(&disp.to_le_bytes());
+    let mut old = 0;
+    // SAFETY: the instruction's bytes, made writable for this and put back;
+    // nothing runs them yet.
+    unsafe {
+        if VirtualProtect(at as *const _, 8, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            return Err("Windows would not make it writable");
+        }
+        std::ptr::copy_nonoverlapping(code.as_ptr(), at as *mut u8, 8);
+        VirtualProtect(at as *const _, 8, old, &mut old);
+        FlushInstructionCache(GetCurrentProcess(), at as *const _, 8);
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_step_constant_is_the_longest_not_over_the_ask() {
+        assert_eq!(step_constant(0.125).map(|c| c.0), Some(0.125));
+        assert_eq!(step_constant(0.15).map(|c| c.0), Some(0.125));
+        assert_eq!(step_constant(0.09), None);
+        assert_eq!(step_constant(1.0).map(|c| c.0), Some(1.0 / 3.0));
+        // The original displacement reaches +0x6159ec0.
+        let disp = i32::from_le_bytes(MAX_STEP_BYTES[4..8].try_into().unwrap()) as i64;
+        assert_eq!(MAX_STEP_SITE as i64 + 8 + disp, 0x6159ec0);
+    }
 
     #[test]
     fn intervals_and_rates() {
