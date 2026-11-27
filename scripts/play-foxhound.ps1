@@ -32,6 +32,8 @@ param(
     [ValidateRange(1, 1000)][int]$Fps = 0,
     [switch]$PrepareOnly,
     [switch]$NoPrepare,
+    # Compile every pipeline the title ever made (88,000+, about 20 minutes), not only those runs drew with.
+    [switch]$FullWarm,
     [hashtable]$More = @{}
 )
 $repo = Split-Path $PSScriptRoot -Parent
@@ -109,18 +111,24 @@ if (-not $NoPrepare) {
     try {
         # Shaders: once per build and per set of switches (some change a translation; what is translated
         # already is found again, so a needless pass costs half a minute).
-        $exeInfo = Get-Item $victory
         # Switches that only measure or show (Kitty6's probe, panel and mods, K6_...) change no translation.
         $measuring = '^(K6_|VICTORY_PROBE|VICTORY_PANEL$|VICTORY_MODS|VICTORY_KEYS$)'
-        $stamp = "$($exeInfo.Length) $($exeInfo.LastWriteTimeUtc.Ticks) $env:VICTORY_HOST_WAVE " + (($settings.GetEnumerator() | Where-Object Name -notmatch $measuring | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' ')
+        # Kitty6: keyed by the translator's fingerprint (what `victory warm` prints, in a second), not by the
+        # executable's size and time: a build that leaves the translator alone keeps every translation.
+        $fp = (& $victory warm --limit 0 2>&1 | Select-String -Pattern 'made before \(([0-9a-f]+)\)' | Select-Object -First 1).Matches.Groups[1].Value
+        if (-not $fp) { $exeInfo = Get-Item $victory; $fp = "$($exeInfo.Length) $($exeInfo.LastWriteTimeUtc.Ticks)" }
+        $stamp = "$fp $env:VICTORY_HOST_WAVE " + (($settings.GetEnumerator() | Where-Object Name -notmatch $measuring | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' ')
         $stampFile = Join-Path $env:LOCALAPPDATA "victory\prepared-$Build.txt"
         if ((Get-Content $stampFile -Raw -ErrorAction SilentlyContinue) -ne $stamp) {
             Write-Host 'Translating the title''s shaders (a few minutes, once per build)...'
             & $victory shaders (Split-Path -Parent $Exe) 2>&1 | Select-Object -Last 3
             if ($LASTEXITCODE -eq 0) { [IO.File]::WriteAllText($stampFile, $stamp) }
         }
-        Write-Host 'Compiling the pipelines earlier runs asked for (seconds, or minutes after a new build or driver)...'
-        & $victory warm 2>&1 | Select-Object -Last 2
+        # Kitty6: by default only the pipelines runs drew with (a few thousand). The driver's cache does not keep
+        # all 88,000 (measured 2026-11-27: pipelines warmed hours before compiled again), while what runs use
+        # lasts in the layer's own pipeline library across builds. -FullWarm: every one, as before.
+        Write-Host 'Compiling the pipelines earlier runs drew with (seconds, or minutes after a translator or driver change)...'
+        if ($FullWarm) { & $victory warm 2>&1 | Select-Object -Last 2 } else { & $victory warm --used 2>&1 | Select-Object -Last 2 }
     } finally { Pop-Location; Remove-Item Env:VICTORY_HOST_WAVE -ErrorAction SilentlyContinue }
 }
 if ($PrepareOnly) { return }

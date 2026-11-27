@@ -30,6 +30,7 @@ param(
     [switch]$NoPanel,
     [switch]$PrepareOnly,
     [switch]$NoPrepare,
+    [switch]$FullWarm,
     [hashtable]$More = @{}
 )
 $repo = Split-Path $PSScriptRoot -Parent
@@ -71,6 +72,7 @@ if ($FrameGen) { $fox.FrameGen = $true }
 if ($Fps -gt 0) { $fox.Fps = $Fps }
 if ($PrepareOnly) { $fox.PrepareOnly = $true }
 if ($NoPrepare) { $fox.NoPrepare = $true }
+if ($FullWarm) { $fox.FullWarm = $true }
 $start = Get-Date
 & (Join-Path $PSScriptRoot 'play-foxhound.ps1') @fox
 # The probe names its file probe-<unix seconds>.csv: the run's is given -Name.

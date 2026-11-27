@@ -15,6 +15,48 @@ fn files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// The `[[package]]` entries of `lock` that `victory-shader` depends on,
+/// itself included, directly or through others, sorted by name.
+fn translator_lock_entries(lock: &str) -> Vec<String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    // name -> (entry text, names it depends on)
+    let mut packages: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
+    for block in lock.split("[[package]]").skip(1) {
+        let block = block.trim().to_owned();
+        let Some(name) = block.lines().find_map(|l| l.strip_prefix("name = ")).map(|n| n.trim_matches('"').to_owned())
+        else {
+            continue;
+        };
+        let mut deps = Vec::new();
+        if let Some(at) = block.find("dependencies = [") {
+            let rest = &block[at + "dependencies = [".len()..];
+            let list = &rest[..rest.find(']').unwrap_or(rest.len())];
+            // `"name"` or `"name version"`: the name is the first word.
+            for dep in list.split(',') {
+                if let Some(dep) = dep.trim().trim_matches('"').split(' ').next()
+                    && !dep.is_empty()
+                {
+                    deps.push(dep.to_owned());
+                }
+            }
+        }
+        // Several versions of one crate: both are kept under one name.
+        let e = packages.entry(name).or_default();
+        e.0.push_str(&block);
+        e.1.extend(deps);
+    }
+    let mut seen = BTreeSet::new();
+    let mut todo = vec!["victory-shader".to_owned()];
+    while let Some(name) = todo.pop() {
+        if seen.insert(name.clone())
+            && let Some((_, deps)) = packages.get(&name)
+        {
+            todo.extend(deps.iter().cloned());
+        }
+    }
+    seen.iter().filter_map(|n| packages.get(n).map(|p| p.0.clone())).collect()
+}
+
 fn main() {
     let here = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_default());
     let crates = here.join("..");
@@ -23,7 +65,6 @@ fn main() {
     let mut all = vec![
         crates.join("victory-shader/Cargo.toml"),
         here.join("src/shader_cache.rs"),
-        root.join("Cargo.lock"),
         root.join("rust-toolchain.toml"),
     ];
     let source = crates.join("victory-shader/src");
@@ -31,6 +72,16 @@ fn main() {
     files(&source, &mut all);
     all.sort();
     let mut hash = blake3::Hasher::new();
+    // Of Cargo.lock, only what the translator is built from (Kitty6): the
+    // whole file made every translation stale whenever any crate of the
+    // workspace took a new dependency, and with it the driver's pipelines
+    // (a 20-minute `victory warm` for a change outside the translator).
+    let lock = root.join("Cargo.lock");
+    println!("cargo:rerun-if-changed={}", lock.display());
+    let lock = std::fs::read_to_string(&lock).unwrap_or_default().replace('\r', "");
+    for entry in translator_lock_entries(&lock) {
+        hash.update(entry.as_bytes());
+    }
     for path in &all {
         println!("cargo:rerun-if-changed={}", path.display());
         // Names and line endings as they are in every checkout.
