@@ -840,6 +840,18 @@ fn aliased_every() -> u64 {
     })
 }
 
+/// `VICTORY_PACKED_LEVELS` (`crate::texture::packed_levels`): of the texture
+/// memory `[at, at + len)` uploaded whole, the bytes up to where the next
+/// placed texture starts inside it, so the looks after the upload read its
+/// own bytes alone: every change of the neighbour was found as a change of
+/// it (after lines9686-rgb b2230981c).
+fn packed_own(at: u64, len: u64) -> u64 {
+    if !crate::texture::packed_levels() {
+        return len;
+    }
+    crate::descriptor::host::next_start(at, at.saturating_add(len)).map_or(len, |next| next - at)
+}
+
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -2746,6 +2758,7 @@ impl State {
                 let memory = if again.is_none() && heap_recheck() { crate::texture::title_span(resource, first) } else { None };
                 match memory {
                     Some((at, len)) => {
+                        let len = packed_own(at, len);
                         let print = crate::texture::fingerprint_texture(at, len);
                         host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
                     }
@@ -2871,6 +2884,7 @@ impl State {
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
+                    let len = packed_own(at, len);
                     let print = crate::texture::fingerprint_texture(at, len);
                     host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
                 }

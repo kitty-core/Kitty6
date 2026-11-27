@@ -756,6 +756,11 @@ impl Spans {
     /// The first span that starts inside `[start, end)` past the first
     /// [`HEAD`] bytes of it.
     fn next_start(&self, start: u64, end: u64) -> Option<u64> {
+        // (A texture no longer than its first block has no room for one;
+        // the range would begin past its end. After lines9686-rgb 32a8c87d.)
+        if start.saturating_add(HEAD) >= end {
+            return None;
+        }
         self.by_start.range(start.saturating_add(HEAD)..end).next().map(|(at, _)| *at)
     }
 
@@ -4624,6 +4629,34 @@ fn make_twinned(
                     && let Some(desc) = &mut desc
                 {
                     show_prefilled(desc, prefilled);
+                }
+                // `VICTORY_PACKED_LEVELS` (`crate::texture::packed_levels`): a
+                // texture with another starting inside its span is shown from
+                // the first level before that start (the larger ones hold
+                // zeros), unless the store filled down to there.
+                let packed = copy.packed.load(std::sync::atomic::Ordering::Relaxed);
+                if packed > prefilled && packed > copy.base {
+                    // SAFETY: a live resource.
+                    let own = unsafe { texture.GetDesc() };
+                    let whole = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        Format: own.Format,
+                        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                        Shader4ComponentMapping: 5768,
+                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Texture2D: D3D12_TEX2D_SRV {
+                                MostDetailedMip: 0,
+                                MipLevels: u32::MAX,
+                                PlaneSlice: 0,
+                                ResourceMinLODClamp: 0.0,
+                            },
+                        },
+                    };
+                    // (in the host copy's levels, which start at `base`; the
+                    // texture's own view only for a plain 2D texture)
+                    let plain = own.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && own.DepthOrArraySize == 1;
+                    if desc.is_some() || plain {
+                        crate::tiles::show_from(desc.get_or_insert(whole), packed - copy.base, u32::from(own.MipLevels));
+                    }
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {

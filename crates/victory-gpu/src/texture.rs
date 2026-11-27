@@ -93,6 +93,12 @@ pub(crate) struct Staging {
     /// recorded again about a second later if the card has room by then
     /// ([`upload`]).
     waiting: std::sync::atomic::AtomicU64,
+    /// `VICTORY_PACKED_LEVELS`, for a texture not made with levels on
+    /// demand: when an upload last asked whether a texture starts inside
+    /// its span (`crate::host::moment`; asked at most every half second),
+    /// and the first title level its views may show (its host copy's).
+    packed_seen: std::sync::atomic::AtomicU64,
+    packed: Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -797,6 +803,19 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         staging.forget();
         staging.dirty.store(true, Relaxed);
     }
+    // `VICTORY_PACKED_LEVELS`: the same for any other placed texture inside
+    // whose span another now starts, or no longer does (asked at most every
+    // half second: the spans' map has a lock of its own).
+    if !staging.on_demand && packed_levels() && staging.packed_may() {
+        let seen = staging.packed_seen.load(Relaxed);
+        if (seen == 0 || crate::host::long_ago(seen, 500, 2))
+            && staging.packed_seen.compare_exchange(seen, crate::host::moment().max(1), Relaxed, Relaxed).is_ok()
+            && staging.packed_limit() != staging.judged()[1]
+        {
+            staging.forget();
+            staging.dirty.store(true, Relaxed);
+        }
+    }
     // Levels on demand: the last upload left a held level without tiles
     // (the card had no room, or no heap could be had), and nothing else
     // would record an upload again until the title writes the texture: the
@@ -1276,6 +1295,27 @@ impl Staging {
         [self.judged[0].load(Relaxed), self.judged[1].load(Relaxed)]
     }
 
+    /// `VICTORY_PACKED_LEVELS`: whether the texture is one whose levels
+    /// [`Staging::held_levels`] can tell apart (one slice, several levels)
+    /// and longer than the first block, inside which no texture is looked
+    /// for.
+    fn packed_may(&self) -> bool {
+        self.layout.slices == 1 && self.layout.mips.len() > 1 && self.layout.size > 4096
+    }
+
+    /// `VICTORY_PACKED_LEVELS`, for a texture not made with levels on
+    /// demand: where the next texture placed in this one's span starts, in
+    /// bytes from this one's start (`u64::MAX`: none does, or the switch is
+    /// off).
+    fn packed_limit(&self) -> u64 {
+        if self.on_demand || !packed_levels() || !self.packed_may() {
+            return u64::MAX;
+        }
+        let start = self.memory as u64;
+        crate::descriptor::host::next_start(start, start.saturating_add(self.layout.size))
+            .map_or(u64::MAX, |at| at - start)
+    }
+
     /// Levels on demand: the levels that are the title's now, a bit a
     /// level. A level is held if no view starts above it, its bytes end
     /// before the next texture starts, and all of them are mapped. The
@@ -1624,6 +1664,39 @@ impl Staging {
             let held = self.held_levels(judged);
             self.detiled.store(held, Relaxed);
             held
+        } else if packed_levels() && self.packed_may() {
+            // `VICTORY_PACKED_LEVELS`: the levels whose bytes lie where
+            // another texture starts are that texture's: zeros here, not its
+            // bytes read as this one's (colour noise, a piece of another
+            // picture), and the views start at the first level before it.
+            use std::sync::atomic::Ordering::Relaxed;
+            let limit = self.packed_limit();
+            self.judged[1].store(limit, Relaxed);
+            let (held, first) = if limit == u64::MAX {
+                (u32::MAX, 0)
+            } else {
+                let held = self.held_levels([0, limit]);
+                let levels = self.layout.mips.len() as u32;
+                // The first level from which on every level is held (none:
+                // the texture as before).
+                match (0..levels).find(|&l| (l..levels).all(|k| held & (1 << k) != 0)) {
+                    Some(first) if held != 0 => (held, first),
+                    _ => (u32::MAX, 0),
+                }
+            };
+            let before = self.packed.swap(first, Relaxed);
+            if before != first {
+                PACKED[usize::from(first < before)].fetch_add(1, Relaxed);
+                let start = self.memory as u64;
+                if first > before {
+                    // Fewer levels: shown from the smaller one now.
+                    crate::descriptor::host::levels_changed(start);
+                } else {
+                    // More: once the upload that fills them has run.
+                    crate::descriptor::host::levels_changed_after(start);
+                }
+            }
+            held
         } else {
             u32::MAX
         };
@@ -1663,6 +1736,30 @@ impl Staging {
         }
     }
 }
+
+/// `VICTORY_PACKED_LEVELS` (on; `=0` off), after lines9686-rgb b2230981c
+/// (fxceless/victory-fork#1401): a placed texture inside whose memory at
+/// full size another placed texture starts (the title holds only its
+/// smallest levels and puts the next texture where the larger ones would
+/// be) is read only as far as that start: the levels past it are zeros in
+/// its host copy and its views start at the first level before it. Without
+/// it only textures with levels on demand were cut so, and any other such
+/// texture showed its neighbour's bytes as its own large levels (noisy,
+/// mosaic faces and skin). Its look after an upload reads its own bytes.
+pub(crate) fn packed_levels() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_PACKED_LEVELS").is_none_or(|v| v != "0");
+        if !on {
+            tracing::info!("VICTORY_PACKED_LEVELS=0: placed textures read up to their full size");
+        }
+        on
+    })
+}
+
+/// `VICTORY_PACKED_LEVELS`: detilings that cut a texture's views to fewer
+/// levels than before, and that gave levels back.
+pub(crate) static PACKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Lets go of a title texture's staging buffer (lists that recorded an
 /// upload from it hold it until they have run); the next upload makes one
@@ -2117,6 +2214,8 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
+        packed_seen: std::sync::atomic::AtomicU64::new(0),
+        packed: copy.packed.clone(),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
