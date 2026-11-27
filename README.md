@@ -9,7 +9,7 @@ with 32 GB of RAM**.
 Nothing from the game is in this repository: only the code that loads,
 translates and runs the files you supply ([docs/asset-policy.md](docs/asset-policy.md)).
 
-## Where it stands (26 November 2026)
+## Where it stands (27 November 2026)
 
 **Not playable yet.** In-game, with a recognisable picture, below a steady 30 fps.
 
@@ -75,10 +75,18 @@ How it got here on this PC, in the order found:
 | <img src="docs/media/bug-blocky-tiles-on-head.jpg" width="260" alt="Blocky black squares over a character's head and back"> | **Blocky tiles** on heads, hair and backs, and stair-stepped sun shadows: **fixed** (halves by the float path, see the [dev log](docs/LOG.md)). |
 | <img src="docs/media/bug-purple-patches-grey-arms.jpg" width="260" alt="A purple patch on a wall and a grey arm"> | **Purple patches** indoors (a fix is on `dev`, not yet checked in the game) and **grey-blue arms**. |
 
-Also: four compute shaders are still refused on NVIDIA (64-lane waves). Mouths
-have the 16-bit fix and are not checked yet. The frame is bound by CPU and GPU
-memory coherence: about 25 MB up and 35-47 MB fetched back per frame, and the
-submitting thread waits for the card about a third of the frame.
+Also:
+- **RAM paging is the main limit now.** Frame rate follows page faults: about
+  17,000 a second gives ~18 fps, about 42,000 a second gives ~10 fps (the boat
+  mission). A kernel fault trace found most of them in the copy of game memory
+  toward the card, reading pages Windows had trimmed. Fixes for this are on
+  `dev` but not yet measured in a full run.
+- **Water** shows flat colour with dark blotches (likely the reflection passes).
+- 34 shadow and volumetric shaders run an approximate 64-lane form on NVIDIA's
+  32-lane waves; an exact form is on `dev`, off (`K6_EXACT_WAVE64=1`).
+- Not tested: a 30-minute session; mouths (16-bit fix not checked).
+- Turning the 2/3 render scale on for the Series X profile made it worse
+  (5.5 fps, heavy paging); the Series S profile already renders at 2/3.
 
 **Follow the work:** [`docs/LOG.md` on the `dev` branch](https://github.com/kitty-core/Kitty6/blob/dev/docs/LOG.md)
 is updated often. `main` only takes tested changes.
@@ -95,6 +103,15 @@ cd Kitty6
 copy victory.example.toml victory.toml      # then set your paths, outside this folder
 cargo build --locked --profile diag -p victory --features diagnostics
 scripts\play.ps1 -Exe <path of your copy's executable> -Lean
+```
+
+The Kitty6 launcher, `scripts\kitty6.ps1`, runs `play.ps1 -Lean` with a preset
+and single changes on or off (`-List` names them):
+
+```powershell
+scripts\kitty6.ps1 -Exe <exe> -Probe                       # Current: every change on
+scripts\kitty6.ps1 -Exe <exe> -Preset Best -Probe          # the settings of the best measured run
+scripts\kitty6.ps1 -Exe <exe> -Off HardWorkingSet          # Current without one change
 ```
 
 Launcher settings (`scripts\play.ps1`):
