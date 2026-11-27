@@ -79,7 +79,11 @@ if ($Lean) {
     $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'
     # Buffer and window copies on the card's unused memory instead of in RAM: in the
     # world about 4 -> 15-20 fps on a 32 GB PC with an 11 GB card (run mix4).
-    $settings.VICTORY_CARD_BUFFERS_MB = '1536'; $settings.VICTORY_CARD_WINDOWS_MB = '1024'
+    # Windows on the card keep no full copy in RAM (K6_WINDOW_NO_CPU_SIDE): each MB of
+    # them is a MB less of private memory, so twice the windows go there.
+    # -More @{K6_WINDOW_NO_CPU_SIDE='0'; VICTORY_CARD_WINDOWS_MB='1024'} for the old setup.
+    $settings.VICTORY_CARD_BUFFERS_MB = '1536'; $settings.VICTORY_CARD_WINDOWS_MB = '2048'
+    $settings.K6_WINDOW_NO_CPU_SIDE = '1'
     # Upstream's renderer patches 1, 2, 5, 6 and 7, its best measured setup on the Series S
     # profile (README: 44.9 ms a frame, run merge-5).
     $settings.VICTORY_PORT_CONSTANTS = '1'; $settings.VICTORY_PORT_DESCRIPTORS = '1'
