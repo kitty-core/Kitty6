@@ -68,6 +68,8 @@ $settings = @{
     # mimalloc hands freed pages back to Windows after 10 ms and takes them again as
     # fresh zeroed pages (~45,000 faults in 12 s in a fault trace): keep them 1 s.
     MIMALLOC_PURGE_DELAY = '1000'
+    # Game time keeps real time down to 8 fps (the title steps at most 1/15 s a frame: slow motion below 15 fps)
+    K6_MAX_STEP_MS = '125'
 }
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'

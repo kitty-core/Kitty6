@@ -204,6 +204,17 @@ pub fn run(
             None => println!("frame rate: our clock {ms} ms; the title's own rate (30) left as it is"),
         }
     }
+    // The game's longest step (K6_MAX_STEP_MS, off without it): game time
+    // keeps up with real time below 15 frames a second.
+    #[cfg(windows)]
+    if execute && let Some(secs) = victory_loader::frame_rate::asked_max_step() {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped and nothing of it has run yet.
+        match unsafe { victory_loader::frame_rate::apply_max_step(image.base(), size, secs) } {
+            Ok(v) => println!("game step: at most {:.0} ms a frame (was 67): game time keeps real time down to {:.0} fps (K6_MAX_STEP_MS)", v * 1000.0, 1.0 / v),
+            Err(why) => println!("game step: K6_MAX_STEP_MS not applied: {why}"),
+        }
+    }
     // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,
     // VICTORY_UPSCALER; each off without it).
     #[cfg(windows)]
