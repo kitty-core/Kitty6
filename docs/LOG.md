@@ -28,6 +28,21 @@ Figures come from scripted runs on one PC (RTX 4070 12 GB, 32 GB RAM, Windows 11
   TRANSLATOR_VERSION 4: the first run rebuilds every shader.
 - `VICTORY_THIN=0` (rota's advice for NVIDIA) measured worse here: 11.6 against
   12.8 fps, prep 52 against 37 ms. `-Lean` keeps THIN=1.
+- Card lost twice in six runs on this build (DXGI 0x887A0007, "reset"), each about
+  3 minutes in, once with the paired form and once without; no driver timeout in the
+  Windows event log. Two runs with `VICTORY_D3D12_DRED=1` did not reproduce it. The
+  title's FSR4 "falling back" lines come after the loss (it rebuilds its passes), not
+  before. Still open.
+- Rota's settings as a set (RT_MISS=1, CARD_STEPS=1, CARD_ALL=1, DYNAMIC_SLOTS,
+  PIPELINE_WORKERS=6, MEMORY_CARD_MB=1024): 11.6 fps, same as without, prep worse.
+- `VICTORY_LIBRARY_PREFETCH` ported from rota (off): with the library file already
+  cached, one stall over a second at world entry against 3-4, same total.
+- The world-entry freeze (6-8 s) is the title's own load: 1.8 million first-touch
+  faults (available RAM drops 4 GB) while its threads sit in `NtReadFile`, disk at
+  9-17 MB/s, our threads mostly idle. Large pages would cut the faults 512x but need
+  the lock-memory privilege and don't mix with write watching; not pursued.
+- With `VICTORY_CARD_STEPS_LEARN=0` the card took 17 ms a frame against 51 with it
+  (the default), in a run cut short at 3 minutes by the card loss above; to confirm.
 
 ## 2026-11-27 (morning)
 
