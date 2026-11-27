@@ -9,6 +9,27 @@ Figures come from scripted runs on one PC (RTX 4070 12 GB, 32 GB RAM, Windows 11
 23H2, Series S profile, opening scene): each is the run's median over its last
 45 s in the world, from the run probes.
 
+## 2026-11-27 (afternoon)
+
+- Shadow tiles (16x16 squares on faces) and water blocks: TaynanGT/Vice-Tay #208 pairs 29
+  programs (18 tiled shadow mask, 4 water volumetrics, 7 sky diffusion) with float sums in
+  the console's order. Their paired files replace ours wholesale; the 29 take the paired
+  form by default (`VICTORY_WAVE_PAIRED_ONLY=none`: off), 29 of 29 taken offline, 0 refused.
+  With the first 26 taken in the game, the user saw the face shadow tiles gone; cutscenes
+  30 to 25 fps. TRANSLATOR_VERSION 6: the next run rebuilds shaders.
+- Card losses (0x887A0007, no driver event) now 3 of 9 runs, each about 3 minutes in;
+  same report on fxceless/victory-fork#1492 (validation finds view-type mismatches).
+  Still open.
+- Where RAM goes (memory map + a per-file walk): NVIDIA's own shader cache files
+  (`DXCache/*.nvph`) mapped at 5 GB with 3.7 GB in our working set. `K6_TRIM_DRIVER_CACHE_S`
+  (off) takes them out every period: available RAM 2.7 to 4.6 GB, but more faults early;
+  to measure in a full run. Also five 1 GB private blocks (3 GB committed, likely the
+  allocator's arenas) against 1.3 GB of our live allocations; to look at.
+- `VICTORY_LIST_POOL=0` (halves the driver's heap on Vice-Tay#97): 6.1 fps here, rejected.
+- `VICTORY_CARD_STEPS_LEARN` costs ~22 ms of card time a frame (29 off, 51 on), fps 12.6 off
+  against 11.8 on.
+- Vice-Tay #103 (held window copies count against the RAM budget) ported.
+
 ## 2026-11-27 (later morning)
 
 - Footage review (15 min of play). Four kinds of fault seen: water drawn as dark
