@@ -9301,6 +9301,8 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
+        #[cfg(feature = "diagnostics")]
+        crate::probe::frame(hwnd.0 as usize);
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {
@@ -9328,6 +9330,17 @@ impl Meter {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
         let dropped = crate::draw::take_dropped() as f64 / frames;
+        // The probes' row and the Kitty6 overlay's numbers (VICTORY_PROBE).
+        #[cfg(feature = "diagnostics")]
+        crate::probe::second(crate::probe::Line {
+            frames,
+            fps,
+            prep_ms: cpu,
+            gpu_ms: gpu,
+            draws,
+            dropped,
+            waiting: crate::pipeline::making(),
+        });
         let indirect = crate::list::take_indirect() as f64 / frames;
         let left_out = crate::pipeline::take_left_out() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
@@ -9789,6 +9802,8 @@ impl Host {
             format
         };
         let (width, height) = (desc.Width as u32, desc.Height);
+        #[cfg(feature = "diagnostics")]
+        crate::probe::set_resolution(width, height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {

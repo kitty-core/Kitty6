@@ -2691,6 +2691,12 @@ mod merge_tests {
 /// snapshot still holds) and the bytes of title memory they copy.
 static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Host copies alive and the bytes they copy (the Kitty6 overlay's telemetry).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn live() -> [u64; 2] {
+    [0, 1].map(|i| LIVE[i].load(Ordering::Relaxed))
+}
+
 impl Drop for Shadow {
     fn drop(&mut self) {
         if self.place.is_some() {

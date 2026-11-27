@@ -163,6 +163,12 @@ impl Pending {
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+            #[cfg(feature = "diagnostics")]
+            crate::probe::pipeline_made(began.elapsed());
+            #[cfg(feature = "diagnostics")]
+            if made.is_none() {
+                crate::probe::pipeline_refused();
+            }
             made
         });
         let (lock, done) = &DONE;
@@ -347,6 +353,8 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    #[cfg(feature = "diagnostics")]
+    crate::probe::pipeline_waited(waited);
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
             ms = waited.as_millis() as u64,

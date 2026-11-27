@@ -76,3 +76,10 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# Kitty6: standalone tool builds, local working notes, never pushed
+/tools/*/target/
+/.claude/
+/CLAUDE.md
+/AGENTS.md
+/docs/scouting.md

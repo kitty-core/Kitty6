@@ -39,6 +39,14 @@ fn asked() -> bool {
     *ON.get_or_init(|| crate::switch::on("VICTORY_PANEL"))
 }
 
+/// `K6_PANEL_LOG=1` (Kitty6): each update's lines also go to the log, one
+/// line, so a run's numbers can be read back without screenshots (the panel
+/// has to be shown: `VICTORY_PANEL=1` or F3).
+fn log_lines() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("K6_PANEL_LOG").is_some_and(|v| v == "1"))
+}
+
 /// Whether it is shown now.
 fn shown() -> &'static AtomicBool {
     static SHOWN: OnceLock<AtomicBool> = OnceLock::new();
@@ -343,6 +351,9 @@ impl Panel {
         self.before = counters;
         let cost = self.cost.as_secs_f64() * 1e6 / frames;
         self.lines = text(&c, elapsed.as_secs_f64() * 1e3 / frames, self.worst, cost, host);
+        if log_lines() {
+            tracing::warn!("panel: {}", self.lines.join(" | "));
+        }
         self.changed = true;
         (self.since, self.frames, self.worst) = (now, 0, 0.0);
         self.cost = now.elapsed();

@@ -1,0 +1,24 @@
+[package]
+name = "kitty6-prof"
+version = "0.1.0"
+edition = "2024"
+description = "Samples every thread's call stack of a running process and says where the time goes"
+license = "GPL-3.0-or-later"
+
+# A tool of its own, outside the game's workspace (and its Cargo.lock).
+[workspace]
+
+[dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Kernel",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_WindowsProgramming",
+] }
+
+[profile.release]
+debug = 1

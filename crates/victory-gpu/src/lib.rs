@@ -89,6 +89,10 @@ pub mod streamline;
 mod switch;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod ab;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod probe;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod telemetry;
 #[cfg(windows)]
 mod tdr;
 #[cfg(windows)]

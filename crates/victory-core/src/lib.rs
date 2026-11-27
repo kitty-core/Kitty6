@@ -4,10 +4,14 @@
 //! * [`policy`]: the runtime half of rule #1, refusing to write
 //!   game-derived data into the source tree.
 //! * [`logging`]: one tracing setup for all binaries.
+//! * [`telemetry`]: the live block a diagnostics build shares with the Kitty6 overlay.
+//! * [`verdict`]: what a slow PC is short of, from a stretch of probe seconds.
 
 pub mod config;
 pub mod logging;
 pub mod policy;
+pub mod telemetry;
+pub mod verdict;
 
 pub use config::Config;
 pub use policy::{PolicyError, ensure_outside_repo};
