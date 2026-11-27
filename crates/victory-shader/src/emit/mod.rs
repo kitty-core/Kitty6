@@ -639,6 +639,10 @@ thread_local! {
     pub(crate) static WAVE_PAIRS_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// [`with_paired_choice`]'s choice, for this thread's translations.
     static PAIRED_CHOICE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// The program being translated is on [`DEFAULT_PAIRED`] ([`with_paired_choice`]): its
+    /// FP32 reductions replay in the console's order unless `VICTORY_WAVE_PAIRS_FP32` says
+    /// otherwise (`paired_fp32`).
+    pub(crate) static PAIRED_DEFAULT_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// What the paired form tried first made of the last program ([`take_paired_outcome`]).
     static PAIRED_OUTCOME: std::cell::RefCell<Option<Result<(), String>>> = const { std::cell::RefCell::new(None) };
 }
@@ -670,6 +674,18 @@ pub fn with_paired_choice<R>(choice: Option<bool>, f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// [`with_paired_choice`] for a program on [`DEFAULT_PAIRED`] or not (`default`).
+pub fn with_paired_default<R>(default: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PAIRED_DEFAULT_HERE.set(self.0);
+        }
+    }
+    let _restore = Restore(PAIRED_DEFAULT_HERE.replace(default));
+    f()
+}
+
 /// What the paired form, tried first ([`with_paired_choice`]), made of the last program this
 /// thread emitted: taken, refused (why), or `None` where it was not tried. Cleared.
 pub fn take_paired_outcome() -> Option<Result<(), String>> {
@@ -698,8 +714,13 @@ pub fn paired_choice(hash: &str) -> Option<bool> {
         let value = |name: &str| std::env::var(name).unwrap_or_default();
         let only = value("VICTORY_WAVE_PAIRED_ONLY");
         let all = only.trim().eq_ignore_ascii_case("all");
-        let mut listed = if all { Vec::new() } else { hash_list(&only) };
+        let none = matches!(only.trim(), "none" | "0");
+        let mut listed = if all || none { Vec::new() } else { hash_list(&only) };
         listed.extend(hash_list(&value("VICTORY_WAVE_PAIRS_ONLY")));
+        // Unset: the programs on DEFAULT_PAIRED (Vice-Tay #208).
+        if only.trim().is_empty() && listed.is_empty() {
+            listed = DEFAULT_PAIRED.iter().map(|h| (*h).to_owned()).collect();
+        }
         let mut not = hash_list(&value("VICTORY_WAVE_PAIRED_ONLY_NOT"));
         not.extend(hash_list(&value("VICTORY_WAVE_PAIRED_NOT")));
         Lists { all, only: listed, not }
@@ -707,9 +728,39 @@ pub fn paired_choice(hash: &str) -> Option<bool> {
     decide_paired(l.all, &l.only, &l.not, hash)
 }
 
+/// Whether `hash` (16 digits, as the log names programs) is on [`DEFAULT_PAIRED`].
+pub fn paired_by_default(hash: &str) -> bool {
+    let hash = hash.trim_start_matches('#').to_ascii_lowercase();
+    DEFAULT_PAIRED.iter().any(|h| hash.starts_with(h))
+}
+
+/// The programs that take the paired form by default on hosts of 32-lane waves (unless
+/// `VICTORY_WAVE_PAIRED_ONLY` names others, or `none`), with their FP32 reductions replayed
+/// in the console's order. From TaynanGT/Vice-Tay #208 (730f3fa6, 42cdc77c), each checked in
+/// game there (RTX 4090, Series S); the other forms leave the picture wrong:
+/// - the tiled shadow mask, `CS_ShadowRenderTiled*` (18): whole 16x16 tiles black or lit;
+/// - the water's transmission volumetrics (`_Tiled`, `_Tiled_LocalLights`, `_Submerged`,
+///   `_GenerateTiles`): dark blocks on open water;
+/// - the atmospheric diffusion and its depth scan (7): a halo around dark silhouettes
+///   against the sky.
+pub const DEFAULT_PAIRED: [&str; 29] = [
+    // shadow mask
+    "191ecaed66eea3b1", "1d44a723bdebbf27", "20b78ee12ecdb57d", "240cb516c1af0bc3",
+    "31d703207b51549a", "466ec41d3f9d24c0", "56f3bf2d9388e5a7", "65de113e23fa4fdd",
+    "804b342cb4b9d1e9", "922e1d0ee1e19a85", "ab5455fc6abb804f", "abd7a22106898c66",
+    "b4b0427232707598", "be6ce5d849d51127", "ce79e9eba7ae0348", "d7db57731ada919b",
+    "f133e35efed2a48a", "fa0bd10a35bfef3c",
+    // water
+    "5dc3b25986622949", "6f225b641c5b0708", "926c46bab3b86bd6", "1aa247ed3653b616",
+    // diffusion / sky
+    "ce2378e5e8711aad", "b7953a05b189dfc1", "71883e40620a567a",
+    "3c196d81eca7ff15", "acf14a70f37fb012", "f79824724d8e2daf", "f0aa2b1e79275592",
+];
+
 /// Whether any paired-form list is set ([`paired_choice`]): without one no hash need be taken.
 pub fn paired_lists_set() -> bool {
-    paired_switches().next().is_some()
+    // DEFAULT_PAIRED applies without any switch set.
+    true
 }
 
 /// The paired-form switches that are set, with their values: for the shader cache key.

@@ -211,13 +211,13 @@ fn paired_key(set: impl Iterator<Item = (&'static str, std::ffi::OsString)>) -> 
 /// (`victory_shader::emit::paired_choice`, by the hash a run's log names it by). Without the
 /// lists, no hash is taken.
 fn translate_with_choice(container: &[u8]) -> Result<HostShader, String> {
-    let choice = if victory_shader::emit::paired_lists_set() {
-        victory_shader::emit::paired_choice(&blake3::hash(container).to_hex()[..16])
-    } else {
-        None
-    };
-    victory_shader::emit::with_paired_choice(choice, || victory_shader::emit::translate(container))
-        .map_err(|e| e.to_string())
+    let hash = blake3::hash(container).to_hex();
+    let choice = victory_shader::emit::paired_choice(&hash[..16]);
+    let default = choice == Some(true) && victory_shader::emit::paired_by_default(&hash[..16]);
+    victory_shader::emit::with_paired_default(default, || {
+        victory_shader::emit::with_paired_choice(choice, || victory_shader::emit::translate(container))
+    })
+    .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
