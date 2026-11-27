@@ -6,6 +6,7 @@
 #   scripts\kitty6.ps1 -Exe <exe> -Off HardWorkingSet,LeanBuffers    # Current minus some changes
 #   scripts\kitty6.ps1 -List                                         # the switches by name
 #
+# The log goes to %LOCALAPPDATA%ictory\logs\kitty6-<time>.log; -Console prints it instead.
 # -Exe can be left out once K6_EXE is set to the executable's path. -Probe and
 # -Panel are passed through; anything else goes in -More @{NAME='value'}.
 param(
@@ -16,6 +17,7 @@ param(
     [hashtable]$More = @{},
     [switch]$Probe,
     [switch]$Panel,
+    [switch]$Console,
     [switch]$List
 )
 
@@ -44,6 +46,12 @@ $settings = @{}
 if ($Preset -eq 'Best') { foreach ($k in $inLean) { $changes[$k].Off.GetEnumerator() | ForEach-Object { $settings[$_.Key] = $_.Value } } }
 foreach ($k in $Off) { if (-not $changes.Contains($k)) { throw "unknown switch $k (see -List)" }; $changes[$k].Off.GetEnumerator() | ForEach-Object { $settings[$_.Key] = $_.Value } }
 foreach ($k in $On)  { if (-not $changes.Contains($k)) { throw "unknown switch $k (see -List)" }; $changes[$k].On.GetEnumerator()  | ForEach-Object { $settings[$_.Key] = $_.Value } }
+# The log goes to a file unless -Console: printing to a console is slow.
+if (-not $Console) {
+    $logs = Join-Path $env:LOCALAPPDATA 'victory\logs'; New-Item -ItemType Directory -Force $logs | Out-Null
+    $settings.K6_LOG_FILE = Join-Path $logs ('kitty6-{0:yyyyMMdd-HHmmss}.log' -f (Get-Date))
+    "log: $($settings.K6_LOG_FILE) (-Console to print it here)"
+}
 $More.GetEnumerator() | ForEach-Object { $settings[$_.Key] = $_.Value }
 
 "Kitty6: preset $Preset" + $(if ($On) { ", on: $($On -join ',')" }) + $(if ($Off) { ", off: $($Off -join ',')" })
