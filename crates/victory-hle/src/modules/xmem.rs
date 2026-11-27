@@ -169,6 +169,9 @@ pub extern "system" fn XMemVirtualAlloc(
         }
     }
     if base.is_null() {
+        // What the title asked for (`VICTORY_SKIP_WC_BACK`).
+        #[cfg(windows)]
+        victory_gpu::title_memory_reserved(at as usize, size, asked);
         tracing::debug!(
             size,
             kind = format_args!("{kind:#x}"),
