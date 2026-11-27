@@ -90,6 +90,10 @@ if ($Lean) {
     # the stand-in estimates it from the frame (ambient.rs). Closer to the console's picture, at no
     # measured cost (runs J/K-ambient, 2026-11-26).
     if (-not $RayTracing) { $settings.VICTORY_AMBIENT = '1' }
+    # Off the serial path (Peppacodes/playablegames-peppa PRs 2 and 6, measured on an RTX 5080):
+    # host objects that waited for a flight dropped on a thread of their own, not on the landing
+    # thread (-23 ms mean there), and landed lists reset on one (-2 to -4 ms there).
+    $settings.VICTORY_BURY_ASIDE = '1'; $settings.VICTORY_LAND_ASIDE = '1'
     $settings.VICTORY_RESIDENCY = '1'; $settings.VICTORY_LOG = 'warn'
     # No device-removal breadcrumbs: in a diagnostics build they also keep a book of
     # up to 400,000 released resources.
