@@ -592,7 +592,6 @@ impl Staging {
             || !self.watched.load(Relaxed)
             || self.on_demand
             || self.once.load(Relaxed)
-            || self.exact.load(Relaxed)
             || self.movie_plane()
             || now.saturating_sub(self.detiled_at.load(Relaxed)) < after
         {
