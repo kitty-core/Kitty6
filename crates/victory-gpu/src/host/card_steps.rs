@@ -673,6 +673,16 @@ mod late {
         *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_STEPS_LEARN").is_none_or(|v| v != "0"))
     }
 
+    /// Forgets every learned page, and holds the tests that learn apart: the
+    /// pages are the process's, and one test's freed memory is the next one's.
+    #[cfg(test)]
+    pub(super) fn forget() -> std::sync::MutexGuard<'static, ()> {
+        static ONE: Mutex<()> = Mutex::new(());
+        let one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        *PAGES.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        one
+    }
+
     /// Whether the title was found writing a page of `[from, to)` late.
     pub(super) fn written(from: usize, to: usize) -> bool {
         let pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
@@ -1182,6 +1192,7 @@ mod tests {
     /// one left alone is not.
     #[test]
     fn places_written_after_sending_are_learned() {
+        let _one = late::forget();
         // Two pages of memory of our own, page-aligned, as title memory.
         let memory = vec![0u8; 4 * 4096];
         let page = (memory.as_ptr() as usize).next_multiple_of(4096);
@@ -1205,6 +1216,7 @@ mod tests {
     /// again before landing, is learned; one that still matches is not.
     #[test]
     fn fills_done_on_the_cpu_are_learned_too() {
+        let _one = late::forget();
         let memory = vec![0u8; 4 * 4096];
         let page = (memory.as_ptr() as usize).next_multiple_of(4096);
         let (kept, changed) = (page + 16, page + 4096 + 0xbd0);
