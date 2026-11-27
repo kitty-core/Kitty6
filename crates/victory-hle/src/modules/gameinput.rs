@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ops::Deref;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
@@ -87,7 +87,8 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
 /// (jump), F Y (enter, interact), R B (reload, back), Q right shoulder,
 /// Tab left shoulder (wheel), Ctrl left stick click (crouch), C right stick
 /// click, M view (map), Esc menu, Enter A, Backspace B, arrows and 1-4 the
-/// d-pad. Menus still answer to Enter, Backspace and the arrows.
+/// d-pad, V drive mode (W and S also throttle and brake). Menus still answer
+/// to Enter, Backspace and the arrows.
 const PC_BUTTONS: [(u8, u32); 22] = [
     (0x1B, MENU), // Esc
     (b'M', VIEW),
@@ -177,10 +178,22 @@ fn fallback(keys: &[KeyState], mouse: Mouse) -> PadState {
     };
     let clamp = |v: f32| v.clamp(-1.0, 1.0);
     if pc_controls() {
+        // Drive mode (V turns it on and off): vehicles take throttle and
+        // brake from the triggers, which on foot are aim and fire, so W and S
+        // also press the right and left triggers while it is on.
+        static V_HELD: AtomicBool = AtomicBool::new(false);
+        static DRIVE: AtomicBool = AtomicBool::new(false);
+        let v = on(b'V') != 0.0;
+        if v && !V_HELD.swap(true, Ordering::Relaxed) {
+            DRIVE.fetch_xor(true, Ordering::Relaxed);
+        } else if !v {
+            V_HELD.store(false, Ordering::Relaxed);
+        }
+        let drive: f32 = if DRIVE.load(Ordering::Relaxed) { 1.0 } else { 0.0 };
         return PadState {
             buttons: PC_BUTTONS.iter().filter(|(vk, _)| on(*vk) != 0.0).fold(0, |all, (_, bit)| all | bit),
-            left_trigger: on(0x02),
-            right_trigger: on(0x01),
+            left_trigger: f32::max(on(0x02), on(b'S') * drive),
+            right_trigger: f32::max(on(0x01), on(b'W') * drive),
             left_x: on(b'D') - on(b'A'),
             left_y: on(b'W') - on(b'S'),
             right_x: clamp(on(b'L') - on(b'J') + mouse.x),

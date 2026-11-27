@@ -121,6 +121,7 @@ connected gamepad always works too.
 | Mouse | Camera (right stick); `K6_MOUSE_SPEED` (pixels a second for full turn speed, 1200), `K6_MOUSE_LOOK=0` turns it off |
 | Left / right mouse button | Fire / aim (right / left trigger) |
 | W A S D | Move (left stick) |
+| V | Drive mode on/off: W and S also throttle and brake (triggers) for boats and cars; turn it off on foot |
 | Shift / Space | Sprint (A) / jump (X) |
 | F / R | Enter, interact (Y) / reload, back (B) |
 | Q or E / Tab | Cover (right shoulder) / weapon wheel (left shoulder) |
