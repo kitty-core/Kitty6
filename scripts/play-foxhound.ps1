@@ -110,7 +110,9 @@ if (-not $NoPrepare) {
         # Shaders: once per build and per set of switches (some change a translation; what is translated
         # already is found again, so a needless pass costs half a minute).
         $exeInfo = Get-Item $victory
-        $stamp = "$($exeInfo.Length) $($exeInfo.LastWriteTimeUtc.Ticks) $env:VICTORY_HOST_WAVE " + (($settings.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' ')
+        # Switches that only measure or show (Kitty6's probe, panel and mods, K6_...) change no translation.
+        $measuring = '^(K6_|VICTORY_PROBE|VICTORY_PANEL$|VICTORY_MODS|VICTORY_KEYS$)'
+        $stamp = "$($exeInfo.Length) $($exeInfo.LastWriteTimeUtc.Ticks) $env:VICTORY_HOST_WAVE " + (($settings.GetEnumerator() | Where-Object Name -notmatch $measuring | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' ')
         $stampFile = Join-Path $env:LOCALAPPDATA "victory\prepared-$Build.txt"
         if ((Get-Content $stampFile -Raw -ErrorAction SilentlyContinue) -ne $stamp) {
             Write-Host 'Translating the title''s shaders (a few minutes, once per build)...'
