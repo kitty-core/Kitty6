@@ -32,7 +32,7 @@ $changes = [ordered]@{
     StagingSettle  = @{ On = @{ VICTORY_STAGING_SETTLE_S = '30' }; Off = @{}; What = 'settled textures give up their staging (off by default)' }
     ListsIdle      = @{ On = @{ VICTORY_LIST_POOL_IDLE_S = '30' }; Off = @{}; What = 'idle host lists let go (off by default)' }
     ExactWave64    = @{ On = @{ K6_EXACT_WAVE64 = '1' };       Off = @{};                             What = 'exact wave64 for 34 shadow/volumetric programs (off by default)' }
-    PairedWave64   = @{ On = @{ VICTORY_WAVE_PAIRED_ONLY = 'all' }; Off = @{};                        What = 'wave64 compute programs in the paired form first (water patches; off by default)' }
+    PairedWave64   = @{ On = @{ VICTORY_WAVE_PAIRED_ONLY = '1aa247ed3653b616,5dc3b25986622949,6871d6e4b3ac9a10,6f225b641c5b0708,926c46bab3b86bd6' }; Off = @{}; What = 'the five water volumetrics programs in the paired form (water patches; =all lost the card here; off by default)' }
 }
 # On in today's -Lean; Best turns these off.
 $inLean = 'HardWorkingSet', 'PurgeDelay', 'LeanWindows', 'LeanBuffers', 'SpareSend', 'Aside'

@@ -9,6 +9,26 @@ Figures come from scripted runs on one PC (RTX 4070 12 GB, 32 GB RAM, Windows 11
 23H2, Series S profile, opening scene): each is the run's median over its last
 45 s in the world, from the run probes.
 
+## 2026-11-27 (later morning)
+
+- Footage review (15 min of play). Four kinds of fault seen: water drawn as dark
+  world-space blocks; bright green/yellow blocks around the bank's lights; single
+  all-white and all-black frames; a sign drawn blank. Plus vertices thrown across
+  the screen and multi-second freezes between scenes.
+- Same water blocks reported on Yaekai/victory-scarlett-3070#2; fxceless#1401 says the
+  paired wave64 form removed them. That form is ported (`VICTORY_WAVE_PAIRED_ONLY`,
+  off). On this card `=all` (878 programs) got the card removed (DXGI 0x887A0005)
+  about 3 minutes in; the same build with it unset ran clean (11.6 fps). On the five
+  `CS_TransmissionVolumetrics*` programs only it ran 8 min clean at the same speed
+  (11.8 fps); the launcher's `-On PairedWave64` now sets those five. Whether it
+  clears the water is not yet seen in the game.
+- avatarmanz's decoder fixes merged (v_nop literal, s_min/s_max SCC, lane wrap,
+  vertex inputs past v255, format 191) and Jrjy3's learned card steps (#434, the
+  stretched characters), plus `VICTORY_TWIN_EXACT` (=1 to try on NVIDIA).
+  TRANSLATOR_VERSION 4: the first run rebuilds every shader.
+- `VICTORY_THIN=0` (rota's advice for NVIDIA) measured worse here: 11.6 against
+  12.8 fps, prep 52 against 37 ms. `-Lean` keeps THIN=1.
+
 ## 2026-11-27 (morning)
 
 - **Paired form for wave64 programs on NVIDIA** (`VICTORY_WAVE_PAIRED_ONLY=all`, off; not yet
