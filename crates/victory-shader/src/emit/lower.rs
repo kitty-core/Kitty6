@@ -1172,7 +1172,7 @@ fn lds_meetings(
                     .filter(|(_, i)| matches!(i.fields, Fields::Ds { .. }) || i.name() == "s_barrier")
                     .map(|(b, i)| format!("b{b}@{:#x} {}", i.machine.offset, i.name()))
                     .collect();
-                eprintln!("WAVE64-LDS-REGION blocks={blocks:?} [{}]", acc.join(", "));
+                eprintln!("WAVE64-LDS-REGION blocks={blocks:?} [{}]{}", acc.join(", "), super::why_tag());
             }
             return None;
         }
@@ -2386,7 +2386,7 @@ impl<'a> Lower<'a> {
                         }
                     }
                     why.sort_unstable();
-                    eprintln!("WAVE64-WHY group={group} lds={} [{}]", s.lds_dwords > 0, why.join(", "));
+                    eprintln!("WAVE64-WHY group={group} lds={} [{}]{}", s.lds_dwords > 0, why.join(", "), super::why_tag());
                 }
             }
             if wave == 32 && x.native.wave64 {

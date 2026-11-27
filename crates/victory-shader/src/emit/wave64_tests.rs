@@ -1536,3 +1536,78 @@ fn a_branch_several_lanes_run_that_reads_and_writes_one_lds_dword_keeps_64_lanes
     // `v_mov_b32 v7, 1`, `v_cmp_eq_u32 vcc, s3, v7`: v7 is alike in every lane: all lanes or none
     assert_eq!(flag_wave(&region_program(&[0x7E0E_0281, 0x7D84_0E03], &bump_region())), Some(64));
 }
+
+/// One console wave: every thread below s0 reads lane 40's thread id (`v_readlane_b32` inside
+/// `if (t < s0)`) and stores it at its own dword; the others store -1. On the console lane
+/// 40's v0 is 40 whatever EXEC holds; a host wave of 32 that answers for its own half alone
+/// reads its own lane 8 (8 in the lower half).
+fn readlane_40_in_a_branch() -> NativeProgram {
+    let mut words = vec![
+        0x7E02_02C1, // v_mov_b32 v1, -1
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0003, // s_cbranch_execz to the restore of EXEC
+    ];
+    words.extend_from_slice(&readlane(7, 0, 40)); // v_readlane_b32 s7, v0, 40
+    words.extend_from_slice(&[
+        0x7E02_0207, // v_mov_b32 v1, s7
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 1 << 8 | 3, // buffer_store_dword v1, v3, s[8:11], 0 offen
+    ]);
+    native(&words)
+}
+
+/// `native` through the whole ladder of forms ([`super::emit`]) for a host of 32-lane waves,
+/// with `K6_EXACT_WAVE64` as `exact` says.
+fn ladder(native: &NativeProgram, exact: bool) -> Result<HostShader, ShaderError> {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, native).expect("io::raise");
+    let container = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&container).expect("container");
+    let host = lower::TEST_HOST_WAVE.replace(Some(32));
+    let was = super::TEST_EXACT_WAVE64.replace(Some(u8::from(exact)));
+    let r = super::emit(&c, native, &p, &st, &io, &res);
+    super::TEST_EXACT_WAVE64.set(was);
+    lower::TEST_HOST_WAVE.set(host);
+    r
+}
+
+/// `K6_EXACT_WAVE64=1` with a lane read across the halves of a console wave inside a per-lane
+/// branch: validated, and on a 32-lane hardware device every thread below s0 reads 40. An
+/// exact form before the approximate ones takes this program (its skip left out), so the
+/// switch leaves it as it was: it changes only programs an approximate form would take (34
+/// of the title's, `translate --list` with `VICTORY_HOST_WAVE=32`).
+#[test]
+fn exact_wave64_reads_a_lane_of_the_other_half_inside_a_lane_branch() {
+    let native = readlane_40_in_a_branch();
+    let exact = ladder(&native, true).expect("the exact ladder");
+    let default = ladder(&native, false).expect("the default ladder");
+    assert_eq!(exact.dxil, default.dxil, "a program no approximate form takes is unchanged");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = exact.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for below in [64u32, 41, 33, 20, 1] {
+        let expected: Vec<u32> = (0..64).map(|t| if t < below { 40 } else { u32::MAX }).collect();
+        let Some(out) = whole_uav(&exact, [below, 0], 64) else {
+            return;
+        };
+        assert_eq!(out, expected, "{below} threads in the branch, K6_EXACT_WAVE64=1");
+    }
+    eprintln!("ran on the hardware device: lane 40 read across the halves in every case");
+}
+
+#[test]
+fn exact_wave64_is_off_by_default() {
+    let was = super::TEST_EXACT_WAVE64.replace(None);
+    // (read from the environment once; the test runner does not set it)
+    if std::env::var_os("K6_EXACT_WAVE64").is_none() {
+        assert!(!super::exact_wave64_on());
+    }
+    super::TEST_EXACT_WAVE64.set(was);
+}

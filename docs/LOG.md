@@ -27,6 +27,29 @@ Figures come from scripted runs on one PC (RTX 4070 12 GB, 32 GB RAM, Windows 11
   translated with APPROXIMATE wave64 emulation, and the water reflection passes. An exact translation is in
   progress. Skipping them by mod rule cleaned the water in shots.
 - Live numbers: https://kitty-core.github.io
+## 2026-11-27
+
+- **Wave64 programs on NVIDIA, exact instead of approximate** (`K6_EXACT_WAVE64=1`,
+  off; not yet tried in the game). The five `CS_TransmissionVolumetrics*` programs
+  were already exact: they take the emulated console wave (`VICTORY_WAVE64_EMULATE`,
+  two 32-lane waves exchanging through LDS). The `APPROXIMATE` lines seen for them
+  belonged to other programs: with many workers the lines of different programs mix.
+  The lines now end with the program's name and hash (`@... #hash`).
+  - 35 programs really did run approximate, each half-wave counting, ORing,
+    electing and reading lanes over its own 32 lanes: shadow masks and shadow-ray
+    traces, `CS_ResolveVolumetrics`, scattering gathers, irradiance cache,
+    fallback lighting, light clustering, temporal resolves with frame statistics,
+    lens-flare scans, the light atlas, fire and decal resolves. With the switch,
+    34 of them take the emulated console wave first. All validate and build on
+    the 4070; no other program changes. `CS_ProjDecalResolve_Scalarized` stays
+    approximate.
+  - `K6_EXACT_WAVE64=2` also comes before the per-half allocation idiom, whose
+    lists come out in a different order (the water reflection pre-passes
+    `CS_RayPrePass_Water_`, `_SSR_`, `CS_Tiling_Generate_Water_`, tiled cascade
+    shadows, instance culling): 89 programs change, all validate and build. For
+    checking only.
+  - `VICTORY_WAVE64_EMULATE` is now in the shader cache key. Before, turning it
+    off still got the emulated translations from the cache.
 
 ## 2026-11-26 (later that night)
 

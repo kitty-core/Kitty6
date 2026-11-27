@@ -160,6 +160,18 @@ fn build() -> [u8; 32] {
         } else if !victory_shader::emit::half_loads_on() {
             bytes.extend_from_slice(b"K6_HALF_LOADS=0");
         }
+        // The emulated console wave of wave64 programs on 32-lane hosts tried before the
+        // approximate forms (`K6_EXACT_WAVE64=1`, `2`: before the allocation idiom too), and
+        // the emulation turned off or forced (`VICTORY_WAVE64_EMULATE`). Only when set, so the
+        // translations cached without them keep their key.
+        match victory_shader::emit::exact_wave64_level() {
+            0 => {}
+            level => bytes.extend_from_slice(format!("K6_EXACT_WAVE64={level}").as_bytes()),
+        }
+        if let Some(value) = std::env::var_os("VICTORY_WAVE64_EMULATE") {
+            bytes.extend_from_slice(b"VICTORY_WAVE64_EMULATE=");
+            bytes.extend_from_slice(value.as_encoded_bytes());
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();

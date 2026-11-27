@@ -576,6 +576,11 @@ fn translate(
 }
 
 fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
+    // (`VICTORY_WAVE_WHY` lines name the program: name, `#hash`, `~code`, without the path)
+    if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+        let line = example();
+        emit::set_why_label(line.rsplit_once('/').map_or(line.as_str(), |(_, tail)| tail));
+    }
     for p in programs {
         t.programs += 1;
         match victory_shader::spill::build(&p) {

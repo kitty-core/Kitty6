@@ -192,6 +192,68 @@ fn group_sync_switch() -> u8 {
 }
 
 thread_local! {
+    /// The program the `VICTORY_WAVE_WHY` lines of this thread are about ([`set_why_label`]).
+    static WHY_LABEL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Names the program this thread translates next in its `VICTORY_WAVE_WHY` lines
+/// (`WAVE64-RETRY ... @<label>`): with several worker threads their lines interleave, and a
+/// form one program took could be read as another's. Empty: no label.
+pub fn set_why_label(label: &str) {
+    WHY_LABEL.with_borrow_mut(|l| {
+        l.clear();
+        l.push_str(label);
+    });
+}
+
+/// `K6_EXACT_WAVE64=1`: a console wave64 compute program on a host of 32-lane waves (NVIDIA)
+/// that only the approximate per-half forms took ("local waves (APPROXIMATE[, any mask])":
+/// each 32-lane host wave counting, ORing, electing and reading lanes over its own half, so a
+/// v_readlane of lane 40 in the lower half or a ballot of the whole console wave gets a
+/// half's answer) is tried first as the emulated console wave ([`widen`] with pairs, which
+/// `VICTORY_WAVE64_EMULATE` otherwise tries only after every approximate form): the two host
+/// waves exchange masks, lane reads and wave-wide branch decisions through LDS, with group
+/// barriers (or pair counters) placed where both halves arrive. Exact, at a few barriers per
+/// cross-lane operation; a program it does not take keeps its approximate form. Off by
+/// default: these programs' barriers sit inside wave-wide branches, the shape that lost the
+/// card with `VICTORY_WAVE_WIDE=1` (runs 121-124), so it wants a game run before it is on.
+/// Needs the emulation itself on (`VICTORY_WAVE64_EMULATE`, on by default on such hosts).
+/// See [`exact_wave64_level`] for `K6_EXACT_WAVE64=2`.
+pub fn exact_wave64_on() -> bool {
+    exact_wave64_level() >= 1
+}
+
+/// `K6_EXACT_WAVE64`: 0 (unset), 1 ([`exact_wave64_on`]), or 2: also before the per-half
+/// allocation idiom ("local waves (idiom)": each host wave reserves its own slots with its
+/// own atomic, so a list the console fills 64 entries per wave comes out in another order and
+/// a wave's entries in two runs; the water reflection pre-passes `CS_RayPrePass_Water_`,
+/// `_SSR_` and `CS_Tiling_Generate_Water_` take that form). Exact in order too, for checking
+/// whether an order-dependent consumer is what goes wrong.
+pub fn exact_wave64_level() -> u8 {
+    #[cfg(test)]
+    if let Some(level) = TEST_EXACT_WAVE64.get() {
+        return level;
+    }
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| match std::env::var("K6_EXACT_WAVE64").ok().as_deref().map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`exact_wave64_level`], for its thread only.
+    pub(super) static TEST_EXACT_WAVE64: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+/// ` @<label>` for the end of a `VICTORY_WAVE_WHY` line ([`set_why_label`]), or nothing.
+pub(crate) fn why_tag() -> String {
+    WHY_LABEL.with_borrow(|l| if l.is_empty() { String::new() } else { format!(" @{l}") })
+}
+
+thread_local! {
     /// The program being translated has every barrier wait ([`sync_full`]).
     static SYNC_FULL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -593,8 +655,8 @@ pub fn emit(
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
                 match r {
-                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
-                    Err(e) => eprintln!("WAVE64-RETRY {what}: {e}"),
+                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}{}", why_tag()),
+                    Err(e) => eprintln!("WAVE64-RETRY {what}: {e}{}", why_tag()),
                 }
             }
         };
@@ -612,7 +674,7 @@ pub fn emit(
             Ok(()) => true,
             Err((offset, what)) => {
                 if why {
-                    eprintln!("WAVE64-RETRY local waves: not the allocation idiom at {offset:#x}: {what}");
+                    eprintln!("WAVE64-RETRY local waves: not the allocation idiom at {offset:#x}: {what}{}", why_tag());
                 }
                 false
             }
@@ -622,7 +684,7 @@ pub fn emit(
         // (`VICTORY_WAVE_WHY=1` says why a form that exists is not tried)
         let failed = |stage: &str, e: ShaderError| {
             if why {
-                eprintln!("WAVE64-FORM {stage}: {e}");
+                eprintln!("WAVE64-FORM {stage}: {e}{}", why_tag());
             }
         };
         let form = |p: Option<ir::Program>| {
@@ -654,6 +716,31 @@ pub fn emit(
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
         let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // The console wave emulated exactly by its two host waves (`VICTORY_WAVE64_EMULATE`,
+        // on where the host has no 64-lane waves), with the per-lane branches around its
+        // cross-lane code and shared memory taken wave-wide ([`widen`]), also in groups of
+        // several console waves; `None` where it does not take the program (or is off).
+        let emulated = |why: bool| -> Option<Result<HostShader, ShaderError>> {
+            if !lower::wave64_emulate_on() || wide_on {
+                return None;
+            }
+            let bases = [
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            for base in bases.into_iter().flatten() {
+                let again = widen(c, native, base, why, true);
+                report("emulated wave64 (wave-wide branches)", &again);
+                if done(&again) {
+                    return Some(again.map(|(shader, _)| shader));
+                }
+            }
+            None
+        };
+        let exact_level = exact_wave64_level();
+        let exact_first = exact_level >= 1;
+        let mut emulated_tried = false;
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -690,8 +777,26 @@ pub fn emit(
                         }
                     }
                 }
+                // `K6_EXACT_WAVE64=1`: the emulated console wave (below, last of all otherwise)
+                // before any approximate form, so that a program the per-half forms take
+                // approximately gets the console's 64 lanes instead (see [`exact_wave64_on`]).
+                if exact_first && !emulated_tried {
+                    emulated_tried = true;
+                    if let Some(r) = emulated(why) {
+                        return r;
+                    }
+                }
                 if strict {
                     break;
+                }
+            }
+            // `K6_EXACT_WAVE64=2`: the emulated console wave before the per-half allocation
+            // idiom too, whose slots come out in another order than the console's
+            // ([`exact_wave64_level`]).
+            if exact && exact_level >= 2 && !emulated_tried {
+                emulated_tried = true;
+                if let Some(r) = emulated(why) {
+                    return r;
                 }
             }
             if !local_on || exact_only {
@@ -740,19 +845,8 @@ pub fn emit(
         // around its cross-lane code and shared memory taken wave-wide ([`widen`]), also in
         // groups of several console waves. Where nothing above translated, so it changes no
         // program that translated before; without it these have no pipeline on such a host.
-        if lower::wave64_emulate_on() && !wide_on {
-            let bases = [
-                forms[1].1.as_ref().map(|f| &f.0),
-                forms[0].1.as_ref().map(|f| &f.0),
-                Some(p),
-            ];
-            for base in bases.into_iter().flatten() {
-                let again = widen(c, native, base, why, true);
-                report("emulated wave64 (wave-wide branches)", &again);
-                if done(&again) {
-                    return again.map(|(shader, _)| shader);
-                }
-            }
+        if !emulated_tried && let Some(r) = emulated(why) {
+            return r;
         }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
@@ -817,7 +911,7 @@ fn widen(
         crate::native::StageIo::Cs(cs) if pairs && cs.threads.iter().product::<u32>() % 64 == 0 => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
-                eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
+                eprintln!("WAVE64-WIDE not tried: thread groups of {:?}{}", cs.threads, why_tag());
             }
             return Err(NOT);
         }
@@ -843,7 +937,7 @@ fn widen(
             || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
         if !stuck {
             if why {
-                eprintln!("WAVE64-WIDE {} branches taken wave-wide", wide.len());
+                eprintln!("WAVE64-WIDE {} branches taken wave-wide{}", wide.len(), why_tag());
             }
             return r;
         }
@@ -854,7 +948,7 @@ fn widen(
             .collect();
         if more.is_empty() {
             if why {
-                eprintln!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len());
+                eprintln!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be{}", wide.len(), why_tag());
             }
             return r;
         }
