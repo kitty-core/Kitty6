@@ -270,6 +270,7 @@ pub fn use_console_timers() {
     }
     ahead_of_other_programs();
     keep_resident();
+    trim_driver_cache();
 }
 
 /// Asks Windows to keep at least half of the PC's RAM of this process in
@@ -331,6 +332,87 @@ fn keep_resident() {
     }
     tracing::warn!("the system refused a minimum working set of 1 GB or more");
 }
+
+/// Lets go of the resident pages of the graphics driver's own shader cache files
+/// (`K6_TRIM_DRIVER_CACHE_S=<seconds>`: how often; unset or `0`: never). A per-file
+/// walk of the game's mapped memory (2026-11-27, in the world) found NVIDIA's
+/// `DXCache/*.nvph` mapped at 5 GB with 3.7 GB of it in RAM: driver binaries
+/// read when a pipeline is made, then idle, and kept in our working set by the
+/// hard minimum (`keep_resident`) where Windows could not take them back. Those
+/// pages are clean file pages: `VirtualUnlock` on a range that is not locked
+/// takes them out of the working set (documented), they stay in Windows' file
+/// cache, and a later read is a soft fault, not a disk read. The views are found
+/// by walking the address space (it holds the process's memory map, so rarely:
+/// at 20 s, 60 s, then every 5 minutes) and trimmed every period.
+#[cfg(windows)]
+fn trim_driver_cache() {
+    let period = match std::env::var("K6_TRIM_DRIVER_CACHE_S").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(0) | None => return,
+        Some(s) => std::time::Duration::from_secs(s),
+    };
+    let _ = std::thread::Builder::new().name("k6-trim-cache".into()).spawn(move || {
+        let began = std::time::Instant::now();
+        let mut views: Vec<(usize, usize)> = Vec::new();
+        let mut next_walk = std::time::Duration::from_secs(20);
+        loop {
+            std::thread::sleep(period);
+            if began.elapsed() >= next_walk {
+                views = driver_cache_views();
+                next_walk = began.elapsed()
+                    + if next_walk < std::time::Duration::from_secs(60) {
+                        std::time::Duration::from_secs(40)
+                    } else {
+                        std::time::Duration::from_secs(300)
+                    };
+                let mb: usize = views.iter().map(|v| v.1).sum::<usize>() >> 20;
+                tracing::warn!(views = views.len(), mb, "K6_TRIM_DRIVER_CACHE_S: driver shader cache views found");
+            }
+            for &(at, len) in &views {
+                // SAFETY: a range of a view the walk found mapped; on pages that
+                // are not locked the call only takes them out of the working set.
+                // A view unmapped since fails the call, which changes nothing.
+                unsafe { windows_sys::Win32::System::Memory::VirtualUnlock(at as *const _, len) };
+            }
+        }
+    });
+}
+
+/// The mapped views of the graphics driver's shader cache files (NVIDIA's
+/// `DXCache/*.nvph`, AMD's `DxCache`/`DxcCache`): `(address, length)`.
+#[cfg(windows)]
+fn driver_cache_views() -> Vec<(usize, usize)> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::ProcessStatus::GetMappedFileNameW;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    let mut name = [0u16; 512];
+    loop {
+        // SAFETY: plain data the call fills in.
+        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a query of our own address space.
+        if unsafe { VirtualQuery(at as *const _, &mut m, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+            break;
+        }
+        let base = m.BaseAddress as usize;
+        if m.State == MEM_COMMIT && m.Type == MEM_MAPPED && m.RegionSize >= 16 << 20 {
+            // SAFETY: a buffer of the length given.
+            let n = unsafe { GetMappedFileNameW(GetCurrentProcess(), m.BaseAddress, name.as_mut_ptr(), name.len() as u32) };
+            let file = String::from_utf16_lossy(&name[..n as usize]).to_ascii_lowercase();
+            if file.ends_with(".nvph") || file.contains("\\dxcache\\") || file.contains("\\dxccache\\") {
+                out.push((base, m.RegionSize));
+            }
+        }
+        match base.checked_add(m.RegionSize) {
+            Some(next) if next > at => at = next,
+            _ => break,
+        }
+    }
+    out
+}
+
+#[cfg(not(windows))]
+fn trim_driver_cache() {}
 
 /// The title's streaming thread runs below normal priority (on the console
 /// nobody else wants its core) and does all of the title's loading: a
