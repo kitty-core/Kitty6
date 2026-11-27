@@ -80,6 +80,54 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (b'H', RIGHT_STICK),
 ];
 
+/// The PC layout of the stand-in pad (`K6_CONTROLS=pc`, the default;
+/// `K6_CONTROLS=pad` is the table above alone). Mouse: camera (right stick),
+/// left button right trigger (fire), right button left trigger (aim), middle
+/// button right stick click. Keys: W/A/S/D move, Shift A (sprint), Space X
+/// (jump), F Y (enter, interact), R B (reload, back), Q right shoulder,
+/// Tab left shoulder (wheel), Ctrl left stick click (crouch), C right stick
+/// click, M view (map), Esc menu, Enter A, Backspace B, arrows and 1-4 the
+/// d-pad. Menus still answer to Enter, Backspace and the arrows.
+const PC_BUTTONS: [(u8, u32); 22] = [
+    (0x1B, MENU), // Esc
+    (b'M', VIEW),
+    (0x0D, A),    // Enter
+    (0xA0, A),    // left Shift
+    (0x08, B),    // Backspace
+    (b'R', B),
+    (0x20, X),    // Space
+    (b'F', Y),
+    (0x26, UP), // arrows
+    (0x28, DOWN),
+    (0x25, LEFT),
+    (0x27, RIGHT),
+    (b'1', UP),
+    (b'2', RIGHT),
+    (b'3', DOWN),
+    (b'4', LEFT),
+    (0x09, LEFT_SHOULDER), // Tab
+    (b'Q', RIGHT_SHOULDER),
+    (0xA2, LEFT_STICK), // left Ctrl
+    (b'C', RIGHT_STICK),
+    (0x04, RIGHT_STICK), // middle mouse button
+    (b'E', RIGHT_SHOULDER),
+];
+
+/// Whether the stand-in pad uses the PC layout ([`PC_BUTTONS`]).
+fn pc_controls() -> bool {
+    static PC: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("K6_CONTROLS").map_or(true, |v| !v.trim().eq_ignore_ascii_case("pad")));
+    *PC
+}
+
+/// The mouse as the camera: right stick deflection (-1 to 1, up positive)
+/// from how fast it moves, and its buttons as virtual keys (1 left, 2 right).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Mouse {
+    x: f32,
+    y: f32,
+}
+
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -113,9 +161,13 @@ trait Source: Send {
     fn keys(&mut self) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// The mouse as a camera stick; nothing unless the host has one.
+    fn mouse(&mut self) -> Mouse {
+        Mouse::default()
+    }
 }
 
-fn fallback(keys: &[KeyState]) -> PadState {
+fn fallback(keys: &[KeyState], mouse: Mouse) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
             1.0
@@ -123,6 +175,18 @@ fn fallback(keys: &[KeyState]) -> PadState {
             0.0
         }
     };
+    let clamp = |v: f32| v.clamp(-1.0, 1.0);
+    if pc_controls() {
+        return PadState {
+            buttons: PC_BUTTONS.iter().filter(|(vk, _)| on(*vk) != 0.0).fold(0, |all, (_, bit)| all | bit),
+            left_trigger: on(0x02),
+            right_trigger: on(0x01),
+            left_x: on(b'D') - on(b'A'),
+            left_y: on(b'W') - on(b'S'),
+            right_x: clamp(on(b'L') - on(b'J') + mouse.x),
+            right_y: clamp(on(b'I') - on(b'K') + mouse.y),
+        };
+    }
     PadState {
         buttons: FALLBACK_BUTTONS
             .iter()
@@ -430,12 +494,12 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, mouse) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            (pads, source.keys(), source.mouse())
         };
-        let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
+        let events = self.state().poll(&self.devices, self.one_pad, pads, keys, mouse);
         self.deliver(events);
     }
 
@@ -481,11 +545,15 @@ impl State {
         one_pad: bool,
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: Mouse,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        let pad_keys = keys;
+        // Mouse buttons (virtual keys below 0x08) feed the stand-in pad only.
+        let keys: Vec<KeyState> = pad_keys.iter().copied().filter(|k| k.virtual_key >= 0x08).collect();
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            let pad = pads.into_iter().flatten().fold(fallback(&pad_keys, mouse), merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
@@ -494,7 +562,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| Value::Pad(fallback(&pad_keys, mouse)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1177,6 +1245,97 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        look: Look,
+    }
+
+    /// The mouse held as a camera: while the game's window is in front (and
+    /// Alt is up) the pointer is hidden over it, kept inside it and brought
+    /// back to its middle every poll; how far it moved, per second and
+    /// smoothed over ~40 ms, is the right stick's deflection. Full deflection
+    /// at `K6_MOUSE_SPEED` pixels a second (1200); the title's dead zone is
+    /// stepped over (`K6_MOUSE_DEADZONE`, 0.18). `K6_MOUSE_LOOK=0`: no mouse.
+    #[derive(Default)]
+    struct Look {
+        held: bool,
+        last: Option<Instant>,
+        x: f32,
+        y: f32,
+    }
+
+    fn look_setting(name: &str, default: f32) -> f32 {
+        std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+    }
+
+    impl Look {
+        fn read(&mut self) -> Mouse {
+            use windows_sys::Win32::Foundation::{POINT, RECT};
+            use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_MENU;
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                ClipCursor, GCLP_HCURSOR, GetCursorPos, GetWindowRect, IDC_ARROW, LoadCursorW, SetClassLongPtrW,
+                SetCursorPos,
+            };
+            static ON: LazyLock<bool> =
+                LazyLock::new(|| pc_controls() && std::env::var("K6_MOUSE_LOOK").map_or(true, |v| v.trim() != "0"));
+            static SPEED: LazyLock<f32> = LazyLock::new(|| look_setting("K6_MOUSE_SPEED", 1200.0).max(1.0));
+            static DEAD: LazyLock<f32> = LazyLock::new(|| look_setting("K6_MOUSE_DEADZONE", 0.18).clamp(0.0, 0.9));
+            if !*ON {
+                return Mouse::default();
+            }
+            // SAFETY: plain queries.
+            let window = unsafe { GetForegroundWindow() };
+            // SAFETY: plain query.
+            let alt = unsafe { GetAsyncKeyState(i32::from(VK_MENU)) } < 0;
+            let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            // SAFETY: a valid out pointer.
+            let ours = focused() && !alt && unsafe { GetWindowRect(window, &mut rect) } != 0;
+            if !ours {
+                if self.held {
+                    self.held = false;
+                    // SAFETY: plain settings: the pointer is free and shown again.
+                    unsafe {
+                        ClipCursor(std::ptr::null());
+                        if !window.is_null() && focused() {
+                            SetClassLongPtrW(window, GCLP_HCURSOR, LoadCursorW(std::ptr::null_mut(), IDC_ARROW) as isize);
+                        }
+                    }
+                }
+                self.last = None;
+                self.x = 0.0;
+                self.y = 0.0;
+                return Mouse::default();
+            }
+            let middle = POINT { x: (rect.left + rect.right) / 2, y: (rect.top + rect.bottom) / 2 };
+            if !self.held {
+                self.held = true;
+                // SAFETY: plain settings on our own window: the pointer is kept
+                // inside it and hidden over it.
+                unsafe {
+                    ClipCursor(&rect);
+                    SetClassLongPtrW(window, GCLP_HCURSOR, 0);
+                    SetCursorPos(middle.x, middle.y);
+                }
+                self.last = Some(Instant::now());
+                return Mouse::default();
+            }
+            let mut at = POINT { x: 0, y: 0 };
+            // SAFETY: a valid out pointer, then a plain setting.
+            unsafe {
+                GetCursorPos(&mut at);
+                SetCursorPos(middle.x, middle.y);
+            }
+            let now = Instant::now();
+            let dt = self.last.map_or(0.008, |t| now.duration_since(t).as_secs_f32()).clamp(0.001, 0.1);
+            self.last = Some(now);
+            let rate = |d: i32| (d as f32 / dt) / *SPEED;
+            // Smoothed: the title reads the pad once a frame (~50 ms here).
+            let k = (dt / 0.04).min(1.0);
+            self.x += (rate(at.x - middle.x) - self.x) * k;
+            self.y += (-rate(at.y - middle.y) - self.y) * k;
+            let shape = |v: f32| {
+                if v.abs() < 0.01 { 0.0 } else { v.signum() * (*DEAD + (1.0 - *DEAD) * v.abs().min(1.0)) }
+            };
+            Mouse { x: shape(self.x), y: shape(self.y) }
+        }
     }
 
     impl Source for Host {
@@ -1224,6 +1383,11 @@ mod host {
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
                 down.extend(held);
+                if pc_controls() {
+                    // Mouse buttons for the stand-in pad's triggers.
+                    // SAFETY: plain queries.
+                    down.extend([0x01_u8, 0x02, 0x04].into_iter().filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0));
+                }
             }
             down.into_iter()
                 .map(|vk| KeyState {
@@ -1235,6 +1399,10 @@ mod host {
                     ..Default::default()
                 })
                 .collect()
+        }
+
+        fn mouse(&mut self) -> Mouse {
+            self.look.read()
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1572,8 +1740,13 @@ mod tests {
         register(hub, KEYBOARD_KIND, 2, &log);
         assert_eq!(*log.lock().unwrap(), [(KEYBOARD, STATUS_CONNECTED, 0)]);
 
+        // The PC layout (K6_CONTROLS unset): C clicks the right stick, the
+        // left mouse button (virtual key 1) is the right trigger and stays
+        // off the keyboard's reading.
         let keys = vec![key(b'W'), key(0x0D), key(b'L'), key(b'C')];
-        host.lock().unwrap().keys = keys.clone();
+        let mut with_mouse = keys.clone();
+        with_mouse.push(key(0x01));
+        host.lock().unwrap().keys = with_mouse;
         hub.poll();
         let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
         let count = slot::<extern "system" fn(*const Reading) -> u32, _>(r, 0x70);
@@ -1589,7 +1762,7 @@ mod tests {
         assert_eq!(
             pad(r),
             PadState {
-                buttons: A,
+                buttons: A | RIGHT_STICK,
                 left_y: 1.0,
                 right_x: 1.0,
                 right_trigger: 1.0,

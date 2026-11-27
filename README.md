@@ -110,11 +110,36 @@ Launcher settings (`scripts\play.ps1`):
 | `-Overlay` | The Kitty6 overlay (F6): live graphs of the run |
 | `-Probe` | A per-second CSV of frame times; compare runs with `victory probe-report` |
 
+### Controls (keyboard and mouse)
+
+With no gamepad connected the keyboard and mouse drive a stand-in pad, laid out
+like a PC game (`K6_CONTROLS=pad` brings back the old pad-like keys). A
+connected gamepad always works too.
+
+| Input | Does (pad button) |
+|---|---|
+| Mouse | Camera (right stick); `K6_MOUSE_SPEED` (pixels a second for full turn speed, 1200), `K6_MOUSE_LOOK=0` turns it off |
+| Left / right mouse button | Fire / aim (right / left trigger) |
+| W A S D | Move (left stick) |
+| Shift / Space | Sprint (A) / jump (X) |
+| F / R | Enter, interact (Y) / reload, back (B) |
+| Q or E / Tab | Cover (right shoulder) / weapon wheel (left shoulder) |
+| Ctrl / C or middle button | Crouch (left stick click) / look back (right stick click) |
+| Esc / M | Pause menu / map (view) |
+| Arrows, 1-4 | D-pad |
+| Enter / Backspace | Accept / back in menus |
+
+The pointer is held inside the window and hidden while the game is in front;
+hold Alt (or switch windows) to get it back.
+
 More on running, the commands and every switch: [docs/README-7900XTX.md](docs/README-7900XTX.md)
 (upstream's README) and [docs/README-fxceless.md](docs/README-fxceless.md). Every
 `VICTORY_...` switch is described in a comment where it is read.
 
 ## Tools made here
+
+- `docs/probe-runs.md`: every saved probe run and what it showed, with the lessons
+  that hold (`tools/charts/probe_table.py` makes its table).
 
 - `tools/kitty6-prof`: samples every thread's stack of the running process, with
   names from the PDB: per thread and per role (submission, list recorders,
