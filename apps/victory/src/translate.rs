@@ -584,7 +584,12 @@ fn translate(
     let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
     // (`VICTORY_WAVE_PAIRED_ONLY` / `_NOT`: what they say of this container, by its hash)
     let choice = emit::paired_lists_set().then(|| emit::paired_choice(&hash)).flatten();
-    emit::with_paired_choice(choice, || translate_programs(&container, programs, &example, t, checks));
+    // (and, as the shader cache does, a program on DEFAULT_PAIRED replays its float sums in
+    // the console's order)
+    let default = choice == Some(true) && emit::paired_by_default(&hash);
+    emit::with_paired_default(default, || {
+        emit::with_paired_choice(choice, || translate_programs(&container, programs, &example, t, checks))
+    });
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);
