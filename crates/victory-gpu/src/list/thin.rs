@@ -223,6 +223,19 @@ impl Recording {
         }
     }
 
+    /// Waits until it is translated, or until `until`: whether it is.
+    pub(crate) fn wait_until(&self, until: std::time::Instant) -> bool {
+        let mut inner = held(&self.inner);
+        while !self.done() {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            inner = self.moved.wait_timeout(inner, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        true
+    }
+
     /// The list of ours it went to (null: it was never begun).
     pub(crate) fn back(&self) -> This {
         held(&self.inner).back as This

@@ -82,6 +82,21 @@ pub(super) trait Work: Send {
     {
         Err(next)
     }
+    /// Whether what is taken along may come from every queue, not only the
+    /// first entry's, and a folded entry may be waited for a while
+    /// ([`Lane::gather`]; `VICTORY_MERGE_SUBMISSIONS=1`).
+    fn merges() -> bool {
+        false
+    }
+    /// With [`Work::merges`]: how long, from the start of a gathering, a
+    /// folded entry may be waited for.
+    fn window() -> Duration {
+        Duration::ZERO
+    }
+    /// Waits until a folded one is free to go, or until `until`: whether it is.
+    fn hold(_: &Self::Ask, _until: Instant) -> bool {
+        false
+    }
     /// Does it. `forced`: its wait was not met.
     fn go(self, forced: bool);
     /// Renderer port #7 (`crate::port_journal`, from renderer patch #4): a mark taken when an entry is
@@ -124,6 +139,10 @@ struct State<W> {
     /// The queue whose entry is being done now (it is no longer in `items`;
     /// what that queue is given stays behind it all the same).
     running: Option<usize>,
+    /// With [`Work::merges`]: the other queues whose entries are being taken
+    /// along with the one being done; what they are given stays behind it
+    /// too.
+    along: Vec<usize>,
     /// Times a look at the line was asked for, and the last of them that a
     /// whole look has followed.
     asked: u64,
@@ -166,6 +185,7 @@ impl<W: Work> Lane<W> {
                 items: VecDeque::new(),
                 next: 0,
                 running: None,
+                along: Vec::new(),
                 asked: 0,
                 served: 0,
                 presents: 0,
@@ -207,7 +227,11 @@ impl<W: Work> Lane<W> {
     /// in between.
     pub(super) fn push_behind(&self, queue: usize, always: bool, what: W, now: impl FnOnce()) {
         let mut state = self.lock();
-        if always || state.running == Some(queue) || state.items.iter().any(|e| e.queue == queue) {
+        if always
+            || state.running == Some(queue)
+            || state.along.contains(&queue)
+            || state.items.iter().any(|e| e.queue == queue)
+        {
             Self::put(&mut state, queue, what, 0);
         } else {
             now();
@@ -381,9 +405,14 @@ impl<W: Work> Lane<W> {
             self.moved.notify_all();
             return true;
         }
+        // With `VICTORY_MERGE_SUBMISSIONS=1`: what can go with it from every
+        // queue ([`Lane::gather`]).
+        if runs > 0 && !forced && W::merges() {
+            runs += self.gather(&mut entry, limit, &mut mark);
+        }
         // What follows it in its queue, if that can go with it. (Nobody else
         // takes anything out, and what comes in goes to the end.)
-        while runs > 0 && !forced {
+        while runs > 0 && !forced && !W::merges() {
             let next = {
                 let mut state = self.lock();
                 let at = state.items.iter().position(|e| e.queue == entry.queue && e.number < limit);
@@ -421,18 +450,179 @@ impl<W: Work> Lane<W> {
             }
         }
         if runs > 0 {
-            let floor = self.lock().floor(entry.queue);
+            STATS[SENT].fetch_add(1, Relaxed);
+            // (Of every queue taken along, too.)
+            let floor = {
+                let state = self.lock();
+                state.along.iter().map(|&q| state.floor(q)).fold(state.floor(entry.queue), u64::max)
+            };
             entry.what.marked(mark.max(floor));
         }
         entry.what.go(forced);
         {
             let mut state = self.lock();
             state.running = None;
+            state.along.clear();
             state.presents -= usize::from(shows);
             state.runs -= runs;
         }
         self.moved.notify_all();
         true
+    }
+
+    /// [`Work::merges`]: takes along with `entry` (being done, of queue
+    /// `entry.queue`) what can go with it from every queue, in the line's
+    /// order and never more than each queue's first entry, so the title's
+    /// order within a queue stays. An entry that cannot go holds what its
+    /// queue has behind it; of the other queues nothing behind a present is
+    /// taken (the entry's own queue goes on past other queues' presents, as
+    /// without the switch). A wait passed over is looked at again once
+    /// something more was taken: a signal or a bottom-of-pipe write taken
+    /// along may meet it. A folded entry not translated yet is waited for
+    /// once, at most [`Work::window`] from the start, when nothing else can
+    /// be taken. `mark` is raised to the marks of what is taken (renderer
+    /// port #7), and a wait taken raises its queue's floor, as in the walk of
+    /// one queue. The submissions taken.
+    fn gather(&self, entry: &mut Entry<W>, limit: u64, mark: &mut u64) -> usize {
+        let began = Instant::now();
+        let until = began + W::window();
+        let mut held = W::window().is_zero();
+        let mut runs = 0;
+        // Queues that give nothing more in this gathering, and those whose
+        // first entry is a wait not met yet (looked at again after a take).
+        let mut hard: Vec<usize> = Vec::new();
+        let mut soft: Vec<usize> = Vec::new();
+        // Runs refused: past a few, the rest of the line is not tried.
+        let mut refused = 0;
+        let mut stop = MERGE_EMPTY;
+        'look: loop {
+            let mut waiting: Option<W::Ask> = None;
+            let mut passed: Vec<usize> = hard.iter().chain(&soft).copied().collect();
+            let mut across = true;
+            let mut at = 0;
+            loop {
+                // The next entry that may be taken, at `at`, found under one
+                // hold of the lock.
+                let next = {
+                    let mut state = self.lock();
+                    loop {
+                        let Some(e) = state.items.get(at) else {
+                            break None;
+                        };
+                        if e.number >= limit {
+                            break None;
+                        }
+                        let queue = e.queue;
+                        let ours = queue == entry.queue;
+                        if passed.contains(&queue) || (!across && !ours) {
+                            passed.push(queue);
+                            at += 1;
+                            continue;
+                        }
+                        if e.what.shows() && !ours {
+                            // What is behind it goes to the card after it.
+                            across = false;
+                            passed.push(queue);
+                            stop = MERGE_PRESENT;
+                            at += 1;
+                            continue;
+                        }
+                        if e.what.folded() {
+                            let ask = e.what.ask();
+                            if ask.as_ref().is_none_or(|ask| W::met(ask)) {
+                                // Its parts take its place.
+                                let Some(folded) = state.items.remove(at) else {
+                                    break None;
+                                };
+                                Self::unfold(&mut state, at, folded);
+                                continue;
+                            }
+                            if waiting.is_none() {
+                                waiting = ask;
+                            }
+                            passed.push(queue);
+                            stop = MERGE_FOLDED;
+                            at += 1;
+                            continue;
+                        }
+                        if !ours && !state.along.contains(&queue) {
+                            state.along.push(queue);
+                        }
+                        break state.items.remove(at);
+                    }
+                };
+                let Some(next) = next else {
+                    break;
+                };
+                let ours = next.queue == entry.queue;
+                let Entry { number, queue, what, mark: theirs } = next;
+                let asks = what.ask().is_some();
+                let waits = asks && what.raises();
+                let kind = if what.shows() {
+                    MERGE_PRESENT
+                } else if what.runs() {
+                    MERGE_REFUSED
+                } else {
+                    MERGE_WAIT
+                };
+                match entry.what.take_along(what) {
+                    Ok(run) => {
+                        runs += usize::from(run);
+                        *mark = (*mark).max(theirs);
+                        if waits {
+                            let later = W::mark_later();
+                            self.lock().raise(queue, later);
+                        }
+                        if !ours {
+                            MERGE_STATS[MERGE_ACROSS].fetch_add(1, Relaxed);
+                        }
+                        if asks && !ours {
+                            MERGE_STATS[MERGE_WAITS_ACROSS].fetch_add(1, Relaxed);
+                        }
+                        if !soft.is_empty() {
+                            // A wait passed over may be met now.
+                            soft.clear();
+                            continue 'look;
+                        }
+                        // (The next entry is at `at` now.)
+                    }
+                    Err(what) => {
+                        self.lock().items.insert(at, Entry { number, queue, what, mark: theirs });
+                        if asks {
+                            soft.push(queue);
+                        } else {
+                            hard.push(queue);
+                        }
+                        passed.push(queue);
+                        stop = kind;
+                        at += 1;
+                        if kind == MERGE_REFUSED {
+                            refused += 1;
+                            if refused >= 3 {
+                                break 'look;
+                            }
+                        }
+                    }
+                }
+            }
+            // Nothing more can be taken now: once, a part not translated yet
+            // is waited for a while.
+            match waiting {
+                Some(ask) if !held && Instant::now() < until => {
+                    held = true;
+                    let waited = Instant::now();
+                    let free = W::hold(&ask, until);
+                    MERGE_STATS[MERGE_HELD_US].fetch_add(waited.elapsed().as_micros() as u64, Relaxed);
+                    MERGE_STATS[if free { MERGE_HELD_MET } else { MERGE_HELD_OUT }].fetch_add(1, Relaxed);
+                    if !free {
+                        break 'look;
+                    }
+                }
+                _ => break 'look,
+            }
+        }
+        MERGE_STATS[stop].fetch_add(1, Relaxed);
+        runs
     }
 }
 
@@ -533,6 +723,21 @@ impl Work for Job {
 
     fn marked(&mut self, mark: u64) {
         crate::port_journal::set_mark(mark);
+    }
+
+    fn merges() -> bool {
+        merge_on()
+    }
+
+    fn window() -> Duration {
+        merge_window()
+    }
+
+    fn hold(ask: &Ask, until: Instant) -> bool {
+        match ask {
+            Ask::Lists(recordings) => recordings.iter().all(|r| r.wait_until(until)),
+            _ => false,
+        }
     }
 
     fn met(ask: &Ask) -> bool {
@@ -693,7 +898,7 @@ static QUEUED: AtomicU64 = AtomicU64::new(0);
 /// threads of the title waited, in microseconds, for room in the line, at a
 /// present, and for a drain, and the drains; what our thread worked; waits
 /// not met at a present.
-static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+static STATS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 const RUNS: usize = 0;
 const PRESENTS: usize = 1;
 const DEPTH: usize = 2;
@@ -706,6 +911,78 @@ const BUSY: usize = 8;
 const FORCED: usize = 9;
 /// Parts prepared together with the one before them.
 const JOINED: usize = 10;
+/// Host submissions the line's thread made of submissions (one for a part
+/// alone, one for parts joined).
+const SENT: usize = 11;
+
+/// With [`merge_on`], since the last frame-rate line: why gatherings ended
+/// (nothing more in the line, a present of another queue, a part not
+/// translated yet, a part not joinable or too many, a wait not met);
+/// entries taken from other queues than the first's, waits among them;
+/// waits for parts not translated: microseconds, met, timed out.
+static MERGE_STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+const MERGE_EMPTY: usize = 0;
+const MERGE_PRESENT: usize = 1;
+const MERGE_FOLDED: usize = 2;
+const MERGE_REFUSED: usize = 3;
+const MERGE_WAIT: usize = 4;
+const MERGE_ACROSS: usize = 5;
+const MERGE_WAITS_ACROSS: usize = 6;
+const MERGE_HELD_US: usize = 7;
+const MERGE_HELD_MET: usize = 8;
+const MERGE_HELD_OUT: usize = 9;
+
+/// Whether the line's thread takes along, with a submission, what can go
+/// with it from every queue and not only its own, and waits a moment for a
+/// part not translated yet (`VICTORY_MERGE_SUBMISSIONS=1`; off by default;
+/// needs `VICTORY_JOIN_PARTS` of 2 or more, which bounds a gathering as it
+/// does without it).
+///
+/// Here after Peppacodes/playablegames-peppa PR 20, which measured -1.9 ms
+/// a frame on an RTX 5080 (41 title submissions a frame went to the card as
+/// about 8). The idea is LooperSalty/AnyXboxX's, pull request 337 by Skyfrye (one host
+/// submission for consecutive title submissions: there, 28 a frame became
+/// about 10.5 and preparing went from 48-52 to 40-46 ms a frame). Here the
+/// line does the holding already ([`Lane`]) and a part takes along what
+/// follows it in its queue ([`Work::take_along`]); what is new:
+///
+/// - entries of the other queues, each queue's first only and in the line's
+///   order, so the title's order within each queue stays: a wait of another
+///   queue for a fence that a signal taken along sets (or that is reached
+///   already) goes with them, and what that queue has behind it too; a wait
+///   passed over is looked at again after each take;
+/// - none of the other queues past a present (what follows a present goes
+///   to the card after it);
+/// - a part whose lists are still being translated is waited for once, at
+///   most [`merge_window`] from the start of the gathering, when nothing
+///   else can be taken.
+///
+/// Why the title cannot tell: everything taken was given by the title
+/// already and stands at nothing that is not met (a wait taken along is met
+/// by memory, by a fence's value now, or by a signal or bottom-of-pipe
+/// write taken along before it, which goes to the card before it in the
+/// same host submission, each part in a call of its own, as
+/// `VICTORY_JOIN_PARTS` sends them). The signals taken along are set once
+/// the whole host submission has run ([`Job::Joined`]): later than before,
+/// never earlier, and no part in it waits for them on the CPU's side, nor
+/// for anything the title's threads do next. What a part reads on the CPU
+/// while it is prepared is checked against what the parts before it in the
+/// gathering give their shaders, as before (`crate::host::joinable`).
+fn merge_on() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_MERGE_SUBMISSIONS") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_SUBMISSIONS").is_some_and(|v| v == "1"))
+}
+
+/// The longest a gathering waits for a part not translated yet
+/// (`VICTORY_MERGE_SUBMISSIONS_US`, 200 microseconds; 0: never).
+fn merge_window() -> Duration {
+    static US: OnceLock<u64> = OnceLock::new();
+    Duration::from_micros(*US.get_or_init(|| number("VICTORY_MERGE_SUBMISSIONS_US").map_or(200, |us| us as u64)))
+}
 
 /// How many submissions may be in the line when a submit call returns
 /// (`VICTORY_SUBMIT_DEPTH`; 64: about two frames of the title's).
@@ -946,6 +1223,27 @@ pub(super) fn line(frames: f64) {
         s[FORCED] / frames,
         s[JOINED] / frames
     );
+    let m: Vec<f64> = MERGE_STATS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "host submissions per frame from the line: {:.1} for {:.1} submissions given (VICTORY_MERGE_SUBMISSIONS=1 \
+         gathers across queues: now {}); gatherings ended at: nothing more {:.1}, a present of another queue {:.1}, \
+         a part not translated {:.1}, a part not joinable or too many {:.1}, a wait not met {:.1}; {:.1} entries \
+         taken from other queues ({:.1} of them waits); waited {:.2} ms for parts not translated, {:.1} times in \
+         time and {:.1} not",
+        s[SENT] / frames,
+        s[RUNS] / frames,
+        merge_on(),
+        m[MERGE_EMPTY],
+        m[MERGE_PRESENT],
+        m[MERGE_FOLDED],
+        m[MERGE_REFUSED],
+        m[MERGE_WAIT],
+        m[MERGE_ACROSS],
+        m[MERGE_WAITS_ACROSS],
+        m[MERGE_HELD_US] / 1000.0,
+        m[MERGE_HELD_MET],
+        m[MERGE_HELD_OUT],
+    );
 }
 
 #[cfg(test)]
@@ -1029,6 +1327,9 @@ mod tests {
                 }
             }
         }
+        fn merges() -> bool {
+            MERGES_HERE.get()
+        }
         fn mark_now() -> u64 {
             NOW.get()
         }
@@ -1047,6 +1348,8 @@ mod tests {
 
     thread_local! {
         static FORCED_HERE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        /// This test's line gathers across queues (`Work::merges`).
+        static MERGES_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// What [`Work::mark_now`] and [`Work::mark_later`] give in a test.
         static NOW: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static LATER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -1095,6 +1398,41 @@ mod tests {
         look(&lane);
         assert!(MARKS.take().is_empty());
         assert_eq!(*log.lock().unwrap(), ["a", "b", "c", "d", "x+y", "present"]);
+    }
+
+    /// Gathering across queues: a wait of another queue met by a signal
+    /// taken along goes with it, and what that queue has behind it; the
+    /// queues keep their order; nothing of another queue past a present.
+    #[test]
+    fn a_gathering_takes_other_queues_behind_a_signal_it_carries() {
+        MERGES_HERE.set(true);
+        let lane = Lane::new();
+        let log: Log = Default::default();
+        let f = fence();
+        let part = |name| T::Group(vec![name], log.clone(), Vec::new());
+        lane.push(2, [T::Wait(f, 1), part("x")]);
+        lane.push(1, [part("a"), T::Signal(f, 1, log.clone()), part("b")]);
+        look(&lane);
+        assert_eq!(*log.lock().unwrap(), ["a+x+b"]);
+        assert_eq!(value(f), 1);
+        // A present of another queue: what is behind it waits for it.
+        lane.push(1, [part("c")]);
+        lane.push(3, [T::Present("present", log.clone())]);
+        lane.push(4, [part("y")]);
+        look(&lane);
+        assert_eq!(*log.lock().unwrap(), ["a+x+b", "c", "present", "y"]);
+        let state = lane.lock();
+        assert_eq!((state.presents, state.runs, state.items.len(), state.along.len()), (0, 0, 0, 0));
+        drop(state);
+        MERGES_HERE.set(false);
+        // Without it, the other queue goes on its own.
+        let log2: Log = Default::default();
+        let g = fence();
+        let part = |name| T::Group(vec![name], log2.clone(), Vec::new());
+        lane.push(2, [T::Wait(g, 1), part("x")]);
+        lane.push(1, [part("a"), T::Signal(g, 1, log2.clone()), part("b")]);
+        look(&lane);
+        assert_eq!(*log2.lock().unwrap(), ["a+b", "x"]);
     }
 
     fn fence() -> usize {
