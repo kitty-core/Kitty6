@@ -269,6 +269,152 @@ pub fn use_console_timers() {
         timeBeginPeriod(1);
     }
     ahead_of_other_programs();
+    keep_resident();
+    trim_driver_cache();
+}
+
+/// A minimum working set, off unless asked (Kitty6; foxhound has none). With
+/// RAM short (22 GB private on a 32 GB PC, our old base) the system took pages
+/// from the game as readily as from idle programs, more so while its window
+/// was not in front, and each stall of 0.6-1.3 s lined up with tens to
+/// hundreds of thousands of faults.
+///
+/// - `K6_MIN_WORKING_SET_MB=<MB>`: a soft minimum of that size (a hint: the
+///   trimmer goes to processes above their minimum first).
+/// - `K6_HARD_WORKING_SET=1`: a hard minimum, by default all of physical
+///   memory but 10 GB (never less than half), or `K6_MIN_WORKING_SET_MB`. A
+///   page-fault trace on the old base (xperf, 12 s in the world, 2026-11-27)
+///   found 408,000 faults in victory.exe, two thirds of them transition faults
+///   (pages Windows had trimmed to its standby list). Pages kept this way are
+///   not given back while the game runs, so it is for A/B runs.
+///
+/// If the system refuses the size, it is lowered in steps of 2 GB (a quarter
+/// at most) until it takes one or gives up below 1 GB. The right to raise the
+/// minimum is every user's (SeIncreaseWorkingSetPrivilege).
+#[cfg(windows)]
+fn keep_resident() {
+    use windows_sys::Win32::System::Memory::{
+        QUOTA_LIMITS_HARDWS_MAX_DISABLE, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MIN_ENABLE,
+        SetProcessWorkingSetSizeEx,
+    };
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let hard = std::env::var_os("K6_HARD_WORKING_SET").is_some_and(|v| v == "1");
+    let asked_mb = std::env::var("K6_MIN_WORKING_SET_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+    if !hard && asked_mb.is_none() {
+        return;
+    }
+    // SAFETY: plain data the call fills in.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a sized structure.
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return;
+    }
+    let Some(mut want) = min_working_set(m.ullTotalPhys, hard, asked_mb) else { return };
+    let max = m.ullTotalPhys;
+    let flags = if hard { QUOTA_LIMITS_HARDWS_MIN_ENABLE } else { QUOTA_LIMITS_HARDWS_MIN_DISABLE };
+    while want >= 1 << 30 {
+        // SAFETY: a plain process setting.
+        let ok = unsafe {
+            SetProcessWorkingSetSizeEx(GetCurrentProcess(), want as usize, max as usize, flags | QUOTA_LIMITS_HARDWS_MAX_DISABLE)
+        } != 0;
+        if ok {
+            tracing::warn!(min_mb = want >> 20, hard, "a minimum working set (K6_MIN_WORKING_SET_MB, K6_HARD_WORKING_SET)");
+            return;
+        }
+        want = want.saturating_sub(2 << 30).min(want / 4 * 3);
+    }
+    tracing::warn!("the system refused a minimum working set of 1 GB or more");
+}
+
+/// The minimum working set asked for, in bytes, on a PC of `total` bytes of
+/// RAM; `None` for none.
+fn min_working_set(total: u64, hard: bool, asked_mb: Option<u64>) -> Option<u64> {
+    match asked_mb {
+        Some(0) => None,
+        Some(mb) => Some(mb << 20),
+        None if hard => Some(total.saturating_sub(10 << 30).max(total / 2)),
+        None => None,
+    }
+}
+
+/// Lets go of the resident pages of the graphics driver's own shader cache files
+/// (`K6_TRIM_DRIVER_CACHE_S=<seconds>`: how often; unset or `0`: never). A per-file
+/// walk of the game's mapped memory (2026-11-27, in the world) found NVIDIA's
+/// `DXCache/*.nvph` mapped at 5 GB with 3.7 GB of it in RAM: driver binaries
+/// read when a pipeline is made, then idle, and kept in our working set by the
+/// hard minimum (`keep_resident`) where Windows could not take them back. Those
+/// pages are clean file pages: `VirtualUnlock` on a range that is not locked
+/// takes them out of the working set (documented), they stay in Windows' file
+/// cache, and a later read is a soft fault, not a disk read. The views are found
+/// by walking the address space (it holds the process's memory map, so rarely:
+/// at 20 s, 60 s, then every 5 minutes) and trimmed every period.
+#[cfg(windows)]
+fn trim_driver_cache() {
+    let period = match std::env::var("K6_TRIM_DRIVER_CACHE_S").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(0) | None => return,
+        Some(s) => std::time::Duration::from_secs(s),
+    };
+    let _ = std::thread::Builder::new().name("k6-trim-cache".into()).spawn(move || {
+        let began = std::time::Instant::now();
+        let mut views: Vec<(usize, usize)> = Vec::new();
+        let mut next_walk = std::time::Duration::from_secs(20);
+        loop {
+            std::thread::sleep(period);
+            if began.elapsed() >= next_walk {
+                views = driver_cache_views();
+                next_walk = began.elapsed()
+                    + if next_walk < std::time::Duration::from_secs(60) {
+                        std::time::Duration::from_secs(40)
+                    } else {
+                        std::time::Duration::from_secs(300)
+                    };
+                let mb: usize = views.iter().map(|v| v.1).sum::<usize>() >> 20;
+                tracing::warn!(views = views.len(), mb, "K6_TRIM_DRIVER_CACHE_S: driver shader cache views found");
+            }
+            for &(at, len) in &views {
+                // SAFETY: a range of a view the walk found mapped; on pages that
+                // are not locked the call only takes them out of the working set.
+                // A view unmapped since fails the call, which changes nothing.
+                unsafe { windows_sys::Win32::System::Memory::VirtualUnlock(at as *const _, len) };
+            }
+        }
+    });
+}
+
+/// The mapped views of the graphics driver's shader cache files (NVIDIA's
+/// `DXCache/*.nvph`, AMD's `DxCache`/`DxcCache`): `(address, length)`.
+#[cfg(windows)]
+fn driver_cache_views() -> Vec<(usize, usize)> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::ProcessStatus::GetMappedFileNameW;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    let mut name = [0u16; 512];
+    loop {
+        // SAFETY: plain data the call fills in.
+        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a query of our own address space.
+        if unsafe { VirtualQuery(at as *const _, &mut m, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+            break;
+        }
+        let base = m.BaseAddress as usize;
+        if m.State == MEM_COMMIT && m.Type == MEM_MAPPED && m.RegionSize >= 16 << 20 {
+            // SAFETY: a buffer of the length given.
+            let n = unsafe { GetMappedFileNameW(GetCurrentProcess(), m.BaseAddress, name.as_mut_ptr(), name.len() as u32) };
+            let file = String::from_utf16_lossy(&name[..n as usize]).to_ascii_lowercase();
+            if file.ends_with(".nvph") || file.contains("\\dxcache\\") || file.contains("\\dxccache\\") {
+                out.push((base, m.RegionSize));
+            }
+        }
+        match base.checked_add(m.RegionSize) {
+            Some(next) if next > at => at = next,
+            _ => break,
+        }
+    }
+    out
 }
 
 /// The title's streaming thread runs below normal priority (on the console
@@ -292,6 +438,16 @@ fn ahead_of_other_programs() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_minimum_working_set_is_off_unless_asked() {
+        const GB: u64 = 1 << 30;
+        assert_eq!(min_working_set(32 * GB, false, None), None);
+        assert_eq!(min_working_set(32 * GB, true, None), Some(22 * GB));
+        assert_eq!(min_working_set(16 * GB, true, None), Some(8 * GB));
+        assert_eq!(min_working_set(32 * GB, false, Some(4096)), Some(4 * GB));
+        assert_eq!(min_working_set(32 * GB, true, Some(0)), None);
+    }
 
     #[test]
     fn a_quoted_angle_bracket_does_not_end_its_tag() {
