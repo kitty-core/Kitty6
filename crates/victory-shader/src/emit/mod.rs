@@ -706,8 +706,13 @@ pub fn take_paired_outcome() -> Option<Result<(), String>> {
 ///   console wave64 compute program on a host of 32-lane waves, or for the listed ones; a
 ///   program it does not take goes on through the other forms as before;
 /// - `VICTORY_WAVE_PAIRED_ONLY_NOT=<hash>,...`: the listed programs never take the paired
-///   form (it wins over the first list). `VICTORY_WAVE_PAIRED_NOT` (cd8fd319a's name) and
-///   `VICTORY_WAVE_PAIRS_ONLY` (#1397's list) are read too.
+///   form (it wins over the first list). `VICTORY_WAVE_PAIRED_NOT` (cd8fd319a's name) is read
+///   too, and `VICTORY_WAVE_PAIRS_ONLY` (#1397's and Vice-Tay's name) as the first list;
+/// - both unset: the programs on [`DEFAULT_PAIRED`]; `none` (or `0`) in either: no program;
+/// - `VICTORY_WAVE_PAIRS=1`: the paired form also as a later form for the others;
+///   `VICTORY_WAVE_PAIRS_FP32=non-ieee-rne-ftz`: float wave sums replayed in the console's
+///   order for any paired program (unset: for those on [`DEFAULT_PAIRED`]; anything else:
+///   none, and a paired program with a float sum is refused).
 ///
 /// Those set are part of the shader cache key (`victory-gpu`'s `shader_cache`).
 pub fn paired_choice(hash: &str) -> Option<bool> {
@@ -719,13 +724,17 @@ pub fn paired_choice(hash: &str) -> Option<bool> {
     static LISTS: std::sync::OnceLock<Lists> = std::sync::OnceLock::new();
     let l = LISTS.get_or_init(|| {
         let value = |name: &str| std::env::var(name).unwrap_or_default();
-        let only = value("VICTORY_WAVE_PAIRED_ONLY");
-        let all = only.trim().eq_ignore_ascii_case("all");
-        let none = matches!(only.trim(), "none" | "0");
-        let mut listed = if all || none { Vec::new() } else { hash_list(&only) };
-        listed.extend(hash_list(&value("VICTORY_WAVE_PAIRS_ONLY")));
-        // Unset: the programs on DEFAULT_PAIRED (Vice-Tay #208).
-        if only.trim().is_empty() && listed.is_empty() {
+        // (`VICTORY_WAVE_PAIRS_ONLY`, Vice-Tay's and #1397's name, the same way)
+        let (only, pairs) = (value("VICTORY_WAVE_PAIRED_ONLY"), value("VICTORY_WAVE_PAIRS_ONLY"));
+        let (only, pairs) = (only.trim(), pairs.trim());
+        let all = [only, pairs].iter().any(|v| v.eq_ignore_ascii_case("all"));
+        let none = [only, pairs].iter().any(|v| v.eq_ignore_ascii_case("none") || *v == "0");
+        let mut listed = if all || none { Vec::new() } else { hash_list(only) };
+        if !all && !none {
+            listed.extend(hash_list(pairs));
+        }
+        // Both unset: the programs on DEFAULT_PAIRED (Vice-Tay #208).
+        if only.is_empty() && pairs.is_empty() {
             listed = DEFAULT_PAIRED.iter().map(|h| (*h).to_owned()).collect();
         }
         let mut not = hash_list(&value("VICTORY_WAVE_PAIRED_ONLY_NOT"));
