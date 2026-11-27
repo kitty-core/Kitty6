@@ -705,6 +705,44 @@ fn f16_max_and_min_order_negative_zero_below_positive_zero() {
     }
 }
 
+/// A NaN operand of a float maximum or minimum gives the other operand
+/// (RDNA2 ISA), and the three-operand forms skip it: with the host's
+/// FMax/FMin alone and with `K6_NAN_MINMAX=1`'s explicit tests.
+#[test]
+fn max_and_min_skip_a_nan_operand() {
+    let nan = 0x7FC0_1234_u32;
+    let f = |x: f32| x.to_bits();
+    let cases = [
+        [nan, f(2.0), f(3.0), 0],
+        [f(2.0), nan, f(3.0), 0],
+        [f(2.0), f(3.0), nan, 0],
+        [nan, nan, f(-1.0), 0],
+    ];
+    // Per case: max, min, max3, min3.
+    let want = [
+        [f(2.0), f(2.0), f(3.0), f(2.0)],
+        [f(2.0), f(2.0), f(3.0), f(2.0)],
+        [f(3.0), f(2.0), f(3.0), f(2.0)],
+        [nan, nan, f(-1.0), f(-1.0)],
+    ];
+    let ops = [("v_max_f32", 0x110), ("v_min_f32", 0x10F), ("v_max3_f32", 0x154), ("v_min3_f32", 0x151)];
+    for explicit in [false, true] {
+        for (k, (name, op)) in ops.into_iter().enumerate() {
+            let was = lower::TEST_NAN_MINMAX.replace(Some(explicit));
+            let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+            lower::TEST_NAN_MINMAX.set(was);
+            run_cases(&shader, &cases, |backend, i, inp, got| {
+                let w = want[i][k];
+                if w == nan {
+                    assert!(f32::from_bits(got).is_nan(), "{backend} explicit={explicit}: {name} {inp:x?} = {got:#x}, want NaN");
+                } else {
+                    assert_eq!(got, w, "{backend} explicit={explicit}: {name} {inp:x?}");
+                }
+            });
+        }
+    }
+}
+
 #[test]
 fn v_min3_max3_med3_integer_forms_match_rdna2() {
     // v_{min3,max3,med3}_{i32,u32} v0, v1, v2, v3 (VOP3 0x152..0x159).

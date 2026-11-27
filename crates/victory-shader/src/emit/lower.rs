@@ -1849,6 +1849,25 @@ fn f16_nearest_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_F16_NEAREST").is_some_and(|v| v == "1"))
 }
 
+/// `K6_NAN_MINMAX=1` (off unless `1`): float minimums and maximums (and
+/// the three-operand forms built on them) pick the other operand of a NaN
+/// with explicit integer tests ([`Lower::max_min`]) rather than trusting
+/// the host's FMax/FMin to.
+fn nan_min_max_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_NAN_MINMAX.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("K6_NAN_MINMAX").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`nan_min_max_on`], for its thread only.
+    pub(super) static TEST_NAN_MINMAX: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 #[cfg(test)]
 thread_local! {
     /// A test's choice for [`f16_nearest_on`], for its thread only.
@@ -4769,7 +4788,19 @@ impl<'a> Lower<'a> {
         let op = if max { Bin::And } else { Bin::Or };
         let sign = self.s.m.bin(c, op, ia, ib);
         let signed = self.as_float(sign);
-        self.s.m.select(c, zeros, signed, r)
+        let r = self.s.m.select(c, zeros, signed, r);
+        if !nan_min_max_on() {
+            return r;
+        }
+        // (`K6_NAN_MINMAX=1`) A NaN operand gives the other operand, and two
+        // NaNs the first (RDNA2 ISA, either IEEE mode for quiet NaNs). DXIL's
+        // FMax/FMin specifies the same; this spells it out with integer NaN
+        // tests a driver cannot fold away, in case a host's minimum does not.
+        // After Marvisak/VIctory#3352 (Thomas73737, 16c700e4), which tests
+        // with `fcmp uno`.
+        let (a_nan, b_nan) = (self.is_nan_f32(a), self.is_nan_f32(b));
+        let r = self.s.m.select(c, a_nan, b, r);
+        self.s.m.select(c, b_nan, a, r)
     }
 
     fn fmad(&mut self, a: V, b: V, c: V) -> V {

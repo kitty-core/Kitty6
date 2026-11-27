@@ -130,6 +130,7 @@ fn build() -> [u8; 32] {
             "VICTORY_NAN_GUARD",
             "VICTORY_NAN_SCRUB",
             "VICTORY_SPILL_STRICT",
+            "K6_NAN_MINMAX",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
