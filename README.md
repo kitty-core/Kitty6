@@ -1,3 +1,64 @@
+# Kitty6 (on foxhound)
+
+**Kitty6** is a fork of [foxhound](https://github.com/readmet3xt-lab/foxhound) by readmet3xt-lab, which is a fork of
+[VIctory](https://github.com/Marvisak/VIctory): a compatibility layer that runs an Xbox Series title natively on
+Windows from files **you** supply. Since 2026-11-27 Kitty6 builds on foxhound (branch `k6-fox`); the older
+VIctory-7900XTX-based Kitty6 (`main`, `dev`) is kept as source material. foxhound's own README follows below,
+unchanged in substance: everything it says holds here, plus what this section adds.
+
+Tuned for one PC: RTX 4070 (12 GB), 32 GB of RAM, Windows 11. Nothing from the game is in this repository.
+
+### Where it stands (27 November 2026)
+
+Measured on that PC, diagnostics build, Series S profile, no DLSS (`scripts\kitty6.ps1` defaults), from the
+logged F3 panel. Runs of 5 to 10 minutes; not long played sessions.
+
+| What | Frame rate |
+|---|---|
+| Opening cutscenes, 3,400 to 4,000 draws | 22 to 27 fps (24.5 median over 9 minutes) |
+| First boat ride and lighter scenes, under 2,500 draws | 28 to 30 fps (the title's 30 fps cap) |
+| Open world, heaviest stretch, about 7,200 draws (plain foxhound, played) | 12 to 18 fps |
+| Same build, open-world stretch overall (plain foxhound, played) | 20 fps average |
+
+Captured frames of the opening cutscenes and the first boat ride show no picture faults (faces without shadow
+tiles, water, sky, distant bridge and HUD as they should be). See [docs/LOG.md](docs/LOG.md) for every run.
+
+### What Kitty6 adds to foxhound
+
+- **`scripts\kitty6.ps1`**: foxhound's launcher with Kitty6's measuring on: the run probe (one CSV row a second,
+  `victory probe-report a.csv b.csv` compares two), foxhound's F3 panel shown and logged (`K6_PANEL_LOG`), renderer
+  mods, and `-Prof <s>` to sample every thread's stack (`tools\kitty6-prof`). It finds the title's executable in
+  the folder above the repository. Defaults: diagnostics build, Series S, no DLSS.
+- **No 20-minute prepare after every build.** The translator's fingerprint now covers only the lock entries the
+  translator is built from (before, any new dependency anywhere made every translation stale), the launcher
+  prepares only when that fingerprint changes, and it then compiles the pipelines runs drew with (about 3,600)
+  rather than all 88,000+: the driver's cache does not keep that many (pipelines warmed hours before were
+  compiled again). `-FullWarm` compiles all of them, as before.
+- **Vice-Tay's paired wave64 form** (TaynanGT/Vice-Tay PR #208): 30 compute programs written for the console's
+  64-lane waves run as pairs of 32-lane waves with float sums in console order, on by default
+  (`VICTORY_WAVE_PAIRED_ONLY=none` turns it off). Two programs foxhound dropped now translate: `926c46bab3b86bd6`
+  (water, submerged) and `a10179ab7eda0dc3` (water volume portals). Not yet checked in game.
+- **`K6_MAX_STEP_MS`** (launcher: 125): the title steps at most 1/15 s a frame, so below 15 fps the game ran in slow
+  motion; with this it keeps real time down to 8 fps.
+- **RAM switches**, off unless asked: `K6_HARD_WORKING_SET`, `K6_TRIM_DRIVER_CACHE_S=<s>` (drops the NVIDIA shader
+  cache file's pages from the process: 3.3 GB here; frees RAM, no frame-rate change measured).
+- **Renderer mods**: `mods\*.k6mod` rule files of our own, by shader hash: `skip` (joins foxhound's
+  `VICTORY_LEAVE_OUT`) or `every <n>` (run one frame in n).
+- **`K6_LOG_FILE=<path>`**: the log to a file instead of the console.
+
+### Known open issues
+
+- `6b82bc7d22016cb5` (an effects pass that culls triangles, groups of 1024) still does not translate: too large
+  for the paired form.
+- Where the frame rate falls, the layer's submitting thread is the limit (refreshing its copies of title memory
+  is the largest part, 4 to 6 ms a frame), not the card: the card shows 100% busy at 95 of 215 W. Larger card
+  copy caps, dropping the full-card waits of the title's barrier groups, and freeing 2.3 GB of RAM each changed
+  nothing measurable. Next: the submitting thread, then RAM (about 1 GB free in heavy scenes).
+- Two victory-gpu tests (`indirect::tests::host_list_budget_starts_empty_at_each_submission`,
+  `warp_batch_charges_every_execution`) fail, as on foxhound itself.
+
+---
+
 # foxhound
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer that runs an Xbox Series title
