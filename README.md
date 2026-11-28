@@ -2,8 +2,8 @@
 
 **Kitty6** is a fork of [foxhound](https://github.com/readmet3xt-lab/foxhound) by readmet3xt-lab, which is a fork of
 [VIctory](https://github.com/Marvisak/VIctory): a compatibility layer that runs an Xbox Series title natively on
-Windows from files **you** supply. Since 2026-11-27 Kitty6 builds on foxhound (branch `k6-fox`); the older
-VIctory-7900XTX-based Kitty6 (`main`, `dev`) is kept as source material. foxhound's own README follows below,
+Windows from files **you** supply. Since 2026-11-27 Kitty6 builds on foxhound (`main` takes tested changes, `dev` work in progress); the older
+VIctory-7900XTX-based Kitty6 is kept on the `legacy-main` and `legacy-dev` branches. foxhound's own README follows below,
 unchanged in substance: everything it says holds here, plus what this section adds.
 
 Tuned for one PC: RTX 4070 (12 GB), 32 GB of RAM, Windows 11. Nothing from the game is in this repository.

@@ -2,7 +2,7 @@
 
 Newest first. Measured on one PC: RTX 4070 12 GB, 32 GB RAM, Windows 11; diagnostics build, Series S profile, no
 DLSS unless said otherwise. "In world" in the tables below means 2,500 draws or more a frame, as the logged F3
-panel counts them. The log of the earlier, VIctory-7900XTX-based Kitty6 is on the `dev` branch.
+panel counts them. The log of the earlier, VIctory-7900XTX-based Kitty6 is on the `legacy-dev` branch.
 
 ## 2026-11-27 (evening): paired wave64 form, prepare only when the translator changes
 
