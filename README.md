@@ -1,5 +1,13 @@
 # Kitty6
 
+> **Kitty6 has moved to a new base (27 November 2026).** New work builds on
+> [foxhound](https://github.com/readmet3xt-lab/foxhound) by readmet3xt-lab, on the
+> [`k6-fox`](https://github.com/kitty-core/Kitty6/tree/k6-fox) branch: on the same PC it ran about twice
+> this tree's frame rate in the open world (about 23 fps against 12 at 3,500 draws). Kitty6's tools, switches
+> and fixes are being moved there; see its [README](https://github.com/kitty-core/Kitty6/tree/k6-fox#readme)
+> and [log](https://github.com/kitty-core/Kitty6/blob/k6-fox/docs/LOG.md). This branch stays as it was, for
+> reference.
+
 A fork of [VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)
 (itself a fork of [VIctory](https://github.com/Marvisak/VIctory)), a
 compatibility layer that runs an Xbox Series title natively on Windows from

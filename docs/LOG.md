@@ -9,6 +9,20 @@ Figures come from scripted runs on one PC (RTX 4070 12 GB, 32 GB RAM, Windows 11
 23H2, Series S profile, opening scene): each is the run's median over its last
 45 s in the world, from the run probes.
 
+## 2026-11-27 (evening): Kitty6 moves to foxhound
+
+- **Kitty6 now builds on [foxhound](https://github.com/readmet3xt-lab/foxhound)** (readmet3xt-lab), on the new
+  [`k6-fox`](https://github.com/kitty-core/Kitty6/tree/k6-fox) branch. On this PC foxhound did about 23 fps at
+  3,500 draws in the open world on a first start, against about 12 on this tree, and 20 fps average over a played
+  open-world stretch. This tree (`dev`, `main`) stays as source material; new work and its log are on `k6-fox`
+  ([its log](https://github.com/kitty-core/Kitty6/blob/k6-fox/docs/LOG.md)).
+- Moved over so far: `K6_MAX_STEP_MS`, `K6_LOG_FILE`, the RAM switches, the probe and `probe-report`, the overlay,
+  `kitty6-prof`, charts, renderer mods, the launcher (`scripts\kitty6.ps1` over foxhound's), and Vice-Tay's paired
+  wave64 form (two water programs foxhound refused now translate).
+- Last on this tree: `K6_MAX_STEP_MS` (this commit's parent). The title steps at most 1/15 s a frame
+  (`+0x2226040`: `min(dt, 1/15)`), so below 15 fps the game ran in slow motion; `K6_MAX_STEP_MS=125` (on in
+  `-Lean`) points that cap at an existing 0.125 constant, verified in a run's log ("at most 125 ms a frame").
+
 ## 2026-11-27 (afternoon)
 
 - Shadow tiles (16x16 squares on faces) and water blocks: TaynanGT/Vice-Tay #208 pairs 29
